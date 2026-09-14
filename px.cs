@@ -69,6 +69,8 @@ class Program
         public const ConsoleColor EnvName = ConsoleColor.Yellow;
         public const ConsoleColor EnvValue = ConsoleColor.DarkGray;
         public const ConsoleColor Error = ConsoleColor.Red;
+        public const ConsoleColor OptName = ConsoleColor.Cyan;
+        public const ConsoleColor OptValue = ConsoleColor.DarkYellow;
     }
 
     class ProcessDetails
@@ -254,7 +256,7 @@ class Program
         "--value-contains", "--env-value-contains", "--value-starts-with", "--env-value-starts-with"
     };
 
-    static readonly string[] BooleanFlags = new[] { "--where", "--args", "--env" };
+    static readonly string[] BooleanFlags = new[] { "--where", "--args", "--env", "--pid" };
 
     static void PrintUsage()
     {
@@ -278,10 +280,16 @@ class Program
         Console.WriteLine("    (no substring/prefix guessing otherwise)");
         Console.WriteLine();
         Console.WriteLine("OTHER FLAGS:");
-        Console.WriteLine("  --where   show the full path to each process's executable (in the PID list, and in");
-        Console.WriteLine("            --args output if given)");
-        Console.WriteLine("  --args    after the PID list, also show a runnable exe+args command line per process");
+        Console.WriteLine("  --pid     always show (PID) on the main line, even with --where/--args");
+        Console.WriteLine("  --where   show the full path to each process's executable");
+        Console.WriteLine("  --args    show the process's command-line args (fancy-colored) on the main line");
         Console.WriteLine("  --env     after everything else, show ALL environment variables for each process");
+        Console.WriteLine();
+        Console.WriteLine("  By default (neither --where nor --args) the main line is '(PID)  name.exe'.");
+        Console.WriteLine("  --where alone shows the full path instead of the PID/name. --args alone shows");
+        Console.WriteLine("  'name.exe <args>' instead of the PID. Add --pid to force the PID to show either way.");
+        Console.WriteLine("  If BOTH --where and --args are given, the main line is 'name.exe <args>' and the full");
+        Console.WriteLine("  path is shown on its own indented line underneath.");
         Console.WriteLine();
         Console.WriteLine("ENV FILTER FLAGS (each implies --env; accepts one or more values, OR'd together):");
         Console.WriteLine("  --env-contains <value> [<value> ...]          (matches if NAME or VALUE contains it)");
@@ -335,6 +343,7 @@ class Program
         public bool ShowWhere = false;
         public bool ShowArgs = false;
         public bool ShowEnvExplicit = false;
+        public bool ShowPidExplicit = false;
 
         // Leftover tokens (not resolved to a process): matched against env var NAMES using
         // an exact-first progression (see CompileImplicitFilters), NOT contains/starts-with,
@@ -401,6 +410,13 @@ class Program
             if (argLower == "--env")
             {
                 result.ShowEnvExplicit = true;
+                i++;
+                continue;
+            }
+
+            if (argLower == "--pid")
+            {
+                result.ShowPidExplicit = true;
                 i++;
                 continue;
             }
@@ -564,6 +580,43 @@ class Program
         Write(ext, Colors.Path);
     }
 
+    // Writes a single already-escaped command-line argument with "fancy" coloring: if it looks
+    // like an option (starts with --, -, or /), the option-name portion (up to the first '='
+    // or ':') is colored as OptName and any attached value after that is colored as OptValue.
+    // Bare positional arguments (no recognized option prefix) are colored as OptValue too.
+    static void WriteArgColored(string arg)
+    {
+        // Account for a possible leading quote (from EscapeArgumentForWindows) so we can still
+        // recognize the option prefix underneath it.
+        string prefix = "";
+        string rest = arg;
+        if (rest.StartsWith("\""))
+        {
+            prefix = "\"";
+            rest = rest.Substring(1);
+        }
+
+        string optPrefix =
+            rest.StartsWith("--") ? "--" :
+            rest.StartsWith("/") ? "/" :
+            rest.StartsWith("-") ? "-" :
+            "";
+
+        if (optPrefix == "")
+        {
+            Write(arg, Colors.OptValue);
+            return;
+        }
+
+        int splitAt = rest.IndexOfAny(new[] { '=', ':' });
+        string namePart = splitAt >= 0 ? rest.Substring(0, splitAt) : rest;
+        string valuePart = splitAt >= 0 ? rest.Substring(splitAt) : "";
+
+        Write(prefix, Colors.Paren);
+        Write(namePart, Colors.OptName);
+        Write(valuePart, Colors.OptValue);
+    }
+
     static void Main(string[] args)
     {
         if (args.Length == 0)
@@ -584,44 +637,82 @@ class Program
         foreach (var pid in parsed.Pids)
             detailsByPid[pid] = GetProcessDetails(pid);
 
-        // --- 1. Primary list: (PID)  NAME, or (PID)  FQN if --where. If env vars should be
-        //     shown, they're printed indented 2 spaces directly under each process's line. ---
-        var listEntries = parsed.Pids
+        bool showPid = parsed.ShowPidExplicit || (!parsed.ShowWhere && !parsed.ShowArgs);
+        bool showLocationIndented = parsed.ShowWhere && parsed.ShowArgs;
+
+        var entries = parsed.Pids
             .Select(pid =>
             {
                 var details = detailsByPid[pid];
-                var display = parsed.ShowWhere && !string.IsNullOrEmpty(details.ImagePath)
-                    ? details.ImagePath
-                    : GetProcessNameSafe(pid) + ".exe";
-                return (Pid: pid, Display: display, UsingPath: parsed.ShowWhere && !string.IsNullOrEmpty(details.ImagePath));
+                var shortName = GetProcessNameSafe(pid) + ".exe";
+                var argv = ParseCommandLine(details.CommandLine);
+                var restArgs = argv.Length > 1 ? argv.Skip(1).Select(EscapeArgumentForWindows).ToArray() : Array.Empty<string>();
+
+                // Sort key matches what's actually relevant/visible: by full path only when
+                // --where is in effect, otherwise by the short name (even if --args is also
+                // shown, since the args themselves aren't a stable sort key).
+                var sortKey = parsed.ShowWhere && !string.IsNullOrEmpty(details.ImagePath) ? details.ImagePath : shortName;
+
+                return (Pid: pid, Details: details, ShortName: shortName, RestArgs: restArgs, SortKey: sortKey);
             })
-            .OrderBy(e => e.Display, StringComparer.OrdinalIgnoreCase)
+            .OrderBy(e => e.SortKey, StringComparer.OrdinalIgnoreCase)
             .ToArray();
 
-        int pidDigits = listEntries.Length == 0 ? 0 : listEntries.Max(e => e.Pid.ToString().Length);
-        foreach (var e in listEntries)
+        int pidDigits = entries.Length == 0 ? 0 : entries.Max(e => e.Pid.ToString().Length);
+
+        foreach (var e in entries)
         {
-            var pidDigitsStr = e.Pid.ToString().PadLeft(pidDigits);
-            Write("(", Colors.Paren);
-            Write(pidDigitsStr, Colors.Pid);
-            Write(")", Colors.Paren);
-            Write("  ");
-            WriteExePathColored(e.Display);
+            if (showPid)
+            {
+                var pidDigitsStr = e.Pid.ToString().PadLeft(pidDigits);
+                Write("(", Colors.Paren);
+                Write(pidDigitsStr, Colors.Pid);
+                Write(")", Colors.Paren);
+                Write("  ");
+            }
+
+            // --- Main line content ---
+            if (parsed.ShowArgs)
+            {
+                Write(e.ShortName, Colors.Name);
+                foreach (var a in e.RestArgs)
+                {
+                    Write(" ");
+                    WriteArgColored(a);
+                }
+            }
+            else if (parsed.ShowWhere && !string.IsNullOrEmpty(e.Details.ImagePath))
+            {
+                WriteExePathColored(e.Details.ImagePath);
+            }
+            else
+            {
+                WriteExePathColored(e.ShortName);
+            }
+
             Console.WriteLine();
 
+            // --- Indented location line, only when both --args and --where are given ---
+            if (showLocationIndented && !string.IsNullOrEmpty(e.Details.ImagePath))
+            {
+                Console.WriteLine();
+                WriteLine("  " + e.Details.ImagePath, Colors.Arg);
+                Console.WriteLine();
+            }
+
+            // --- Env vars, only if explicitly requested or filtered ---
             if (!parsed.ShouldShowEnv) continue;
 
-            Console.WriteLine();
+            if (!showLocationIndented) Console.WriteLine();
 
-            var details = detailsByPid[e.Pid];
-            if (!string.IsNullOrEmpty(details.Error))
+            if (!string.IsNullOrEmpty(e.Details.Error))
             {
-                WriteLine("  " + details.Error, Colors.Error);
+                WriteLine("  " + e.Details.Error, Colors.Error);
                 Console.WriteLine();
                 continue;
             }
 
-            var vars = details.EnvBlock.Split('\0').Where(v => !string.IsNullOrEmpty(v)).ToArray();
+            var vars = e.Details.EnvBlock.Split('\0').Where(v => !string.IsNullOrEmpty(v)).ToArray();
             Array.Sort(vars, StringComparer.OrdinalIgnoreCase);
 
             var parsedVars = vars.Select(v =>
@@ -652,44 +743,6 @@ class Program
                 WriteLine("  (no matching environment variables)", Colors.Arg);
 
             Console.WriteLine();
-        }
-
-        // --- 2. Optional: --args (uses FQN if --where was also given, else just the name) ---
-        if (parsed.ShowArgs)
-        {
-            Console.WriteLine();
-
-            var argEntries = parsed.Pids
-                .Select(pid =>
-                {
-                    var details = detailsByPid[pid];
-                    var usingPath = parsed.ShowWhere && !string.IsNullOrEmpty(details.ImagePath);
-                    var exeDisplay = usingPath
-                        ? details.ImagePath
-                        : GetProcessNameSafe(pid) + ".exe";
-
-                    var argv = ParseCommandLine(details.CommandLine);
-                    var restArgs = argv.Length > 1 ? argv.Skip(1).Select(EscapeArgumentForWindows).ToArray() : Array.Empty<string>();
-                    return (SortKey: exeDisplay, RawExe: exeDisplay, UsingPath: usingPath, RestArgs: restArgs);
-                })
-                .OrderBy(e => e.SortKey, StringComparer.OrdinalIgnoreCase)
-                .ToArray();
-
-            foreach (var e in argEntries)
-            {
-                bool hasSpace = e.RawExe.IndexOfAny(new[] { ' ', '\t' }) >= 0;
-                if (hasSpace) Write("\"", Colors.Paren);
-                if (e.UsingPath) WriteExePathColored(e.RawExe);
-                else Write(e.RawExe, Colors.Name);
-                if (hasSpace) Write("\"", Colors.Paren);
-
-                foreach (var a in e.RestArgs)
-                {
-                    Write(" ");
-                    Write(a, Colors.Arg);
-                }
-                Console.WriteLine();
-            }
         }
     }
 }
