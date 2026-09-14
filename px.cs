@@ -64,7 +64,7 @@ class Program
         public const ConsoleColor Paren = ConsoleColor.DarkGray;
         public const ConsoleColor Pid = ConsoleColor.Green;
         public const ConsoleColor Name = ConsoleColor.Blue;
-        public const ConsoleColor Path = ConsoleColor.Gray;
+        public const ConsoleColor Path = ConsoleColor.DarkGray;
         public const ConsoleColor Arg = ConsoleColor.DarkGray;
         public const ConsoleColor EnvName = ConsoleColor.Yellow;
         public const ConsoleColor EnvValue = ConsoleColor.DarkGray;
