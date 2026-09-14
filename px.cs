@@ -250,7 +250,8 @@ class Program
 
     static readonly string[] FilterFlags = new[]
     {
-        "--env-contains", "--env-name-contains", "--env-name-starts-with", "--env-value-contains", "--env-value-starts-with"
+        "--contains", "--env-contains", "--name-contains", "--env-name-contains", "--name-starts-with", "--env-name-starts-with",
+        "--value-contains", "--env-value-contains", "--value-starts-with", "--env-value-starts-with"
     };
 
     static readonly string[] BooleanFlags = new[] { "--where", "--args", "--env" };
@@ -288,6 +289,9 @@ class Program
         Console.WriteLine("  --env-name-starts-with <value> [<value> ...]");
         Console.WriteLine("  --env-value-contains <value> [<value> ...]");
         Console.WriteLine("  --env-value-starts-with <value> [<value> ...]");
+        Console.WriteLine();
+        Console.WriteLine("  Shorter aliases (--contains, --name-contains, --name-starts-with, --value-contains,");
+        Console.WriteLine("  --value-starts-with) are also accepted for all of the above.");
         Console.WriteLine();
         Console.WriteLine("  A leftover positional token (not resolved to a process) also implies --env and acts");
         Console.WriteLine("  as an env-var NAME filter (see below).");
@@ -405,11 +409,11 @@ class Program
             {
                 var target = arg.ToLowerInvariant() switch
                 {
-                    "--env-contains" => result.Contains,
-                    "--env-name-contains" => result.NameContains,
-                    "--env-name-starts-with" => result.NameStartsWith,
-                    "--env-value-contains" => result.ValueContains,
-                    "--env-value-starts-with" => result.ValueStartsWith,
+                    "--contains" or "--env-contains" => result.Contains,
+                    "--name-contains" or "--env-name-contains" => result.NameContains,
+                    "--name-starts-with" or "--env-name-starts-with" => result.NameStartsWith,
+                    "--value-contains" or "--env-value-contains" => result.ValueContains,
+                    "--value-starts-with" or "--env-value-starts-with" => result.ValueStartsWith,
                     _ => null
                 };
                 i++;
