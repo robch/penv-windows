@@ -324,20 +324,127 @@ class Program
 
     static readonly string[] BooleanFlags = new[] { "--where", "--args", "--env", "--pid", "--all" };
 
+    // --- Help-text colorizing helpers -----------------------------------------------------
+
+    static readonly Regex InlineFlagPattern = new(@"(--[a-zA-Z][a-zA-Z0-9-]*)");
+
+    // Highlights any --flag-looking word mentioned inline within a plain descriptive sentence.
+    static void WriteBodyLine(string line)
+    {
+        var parts = InlineFlagPattern.Split(line);
+        foreach (var part in parts)
+        {
+            if (part.StartsWith("--"))
+                Write(part, Colors.OptName);
+            else
+                Console.Write(part);
+        }
+        Console.WriteLine();
+    }
+
+    static void WriteSectionHeader(string text) => WriteLine(text, Colors.Header);
+
+    static List<string> TokenizeExample(string s)
+    {
+        var tokens = new List<string>();
+        int i = 0;
+        while (i < s.Length)
+        {
+            while (i < s.Length && s[i] == ' ') i++;
+            if (i >= s.Length) break;
+
+            int start = i;
+            if (s[i] == '\'' || s[i] == '"')
+            {
+                char q = s[i];
+                i++;
+                while (i < s.Length && s[i] != q) i++;
+                if (i < s.Length) i++;
+            }
+            else
+            {
+                while (i < s.Length && s[i] != ' ') i++;
+            }
+            tokens.Add(s.Substring(start, i - start));
+        }
+        return tokens;
+    }
+
+    // Colors a single example-command token using the same semantic rules as real px output:
+    // quoted tokens -> QuotedString, numeric -> Pid, flags -> OptName(+OptValue), bare words
+    // before the first flag -> Subcommand (process name/fragment target), bare words after
+    // the first flag -> OptValue (a value belonging to the preceding flag).
+    static void WriteExampleToken(string arg, ref bool seenOption)
+    {
+        if (arg.Length >= 2 && (arg[0] == '\'' || arg[0] == '"') && arg[^1] == arg[0])
+        {
+            Write(arg, Colors.QuotedString);
+            return;
+        }
+
+        if (int.TryParse(arg, out _))
+        {
+            Write(arg, Colors.Pid);
+            return;
+        }
+
+        bool isOption = arg.StartsWith("--") || arg.StartsWith("/") || arg.StartsWith("-");
+        if (!isOption)
+        {
+            Write(arg, seenOption ? Colors.OptValue : Colors.Subcommand);
+            return;
+        }
+
+        seenOption = true;
+        int splitAt = arg.IndexOfAny(new[] { '=', ':' });
+        string namePart = splitAt >= 0 ? arg.Substring(0, splitAt) : arg;
+        string valuePart = splitAt >= 0 ? arg.Substring(splitAt) : "";
+
+        Write(namePart, Colors.OptName);
+        if (valuePart.Length > 0)
+        {
+            Write(valuePart.Substring(0, 1), Colors.Muted);
+            Write(valuePart.Substring(1), Colors.OptValue);
+        }
+    }
+
+    // Writes one fully-colorized "  px ... " example line, with an optional trailing
+    // "(explanatory comment)" rendered in the muted comment color.
+    static void WriteExampleLine(string command, string comment = "")
+    {
+        Write("  ");
+        var tokens = TokenizeExample(command);
+        bool seenOption = false;
+        for (int i = 0; i < tokens.Count; i++)
+        {
+            if (i > 0) Write(" ");
+            if (i == 0) { Write(tokens[i], Colors.Name); continue; } // "px" itself
+            WriteExampleToken(tokens[i], ref seenOption);
+        }
+
+        if (!string.IsNullOrEmpty(comment))
+        {
+            Write("    ");
+            Write(comment, Colors.Muted);
+        }
+
+        Console.WriteLine();
+    }
+
     static void PrintUsage()
     {
         WriteLine("px - inspect running processes: list PIDs, exe paths, command lines, and env vars", Colors.Header);
         Console.WriteLine();
-        Console.WriteLine("USAGE:");
+        WriteSectionHeader("USAGE:");
         Console.WriteLine("  px <pid|process-name|name-fragment> [...] [<filter-value> ...] [<filter-flag> <value> [<value> ...]] ...");
         Console.WriteLine();
-        Console.WriteLine("HOW PROCESS TARGETS ARE RESOLVED (in order):");
+        WriteSectionHeader("HOW PROCESS TARGETS ARE RESOLVED (in order):");
         Console.WriteLine("  1. Numeric token           -> treated as a PID");
         Console.WriteLine("  2. Exact process name match -> that process (case-insensitive)");
         Console.WriteLine("  3. Token has '*' or '?'     -> glob match against process names (e.g. 'cyco*')");
         Console.WriteLine("  4. If NOTHING matched yet   -> try remaining tokens as name substrings (e.g. 'chrome')");
         Console.WriteLine();
-        Console.WriteLine("HOW LEFTOVER TOKENS BECOME ENV-VAR FILTERS:");
+        WriteSectionHeader("HOW LEFTOVER TOKENS BECOME ENV-VAR FILTERS:");
         Console.WriteLine("  Once at least one process target is resolved, any leftover token filters env vars");
         Console.WriteLine("  by NAME, in this order:");
         Console.WriteLine("    1. Token has '*' or '?'        -> glob match against variable names");
@@ -345,49 +452,51 @@ class Program
         Console.WriteLine("    3. Exact match (case-insensitive) -> used only if no case-sensitive match exists");
         Console.WriteLine("    (no substring/prefix guessing otherwise)");
         Console.WriteLine();
-        Console.WriteLine("OTHER FLAGS:");
-        Console.WriteLine("  --pid     always show (PID) on the main line, even with --where/--args");
-        Console.WriteLine("  --where   show the full path to each process's executable");
-        Console.WriteLine("  --args    show the process's command-line args (fancy-colored) on the main line");
-        Console.WriteLine("  --env     after everything else, show ALL environment variables for each process");
+        WriteSectionHeader("OTHER FLAGS:");
+        WriteBodyLine("  --pid     always show (PID) on the main line, even with --where/--args");
+        WriteBodyLine("  --where   show the full path to each process's executable");
+        WriteBodyLine("  --args    show the process's command-line args (fancy-colored) on the main line");
+        WriteBodyLine("  --env     after everything else, show ALL environment variables for each process");
+        WriteBodyLine("  --all     also show processes with no matching environment variables (see below)");
         Console.WriteLine();
-        Console.WriteLine("  By default (neither --where nor --args) the main line is '(PID)  name.exe'.");
-        Console.WriteLine("  --where alone shows the full path instead of the PID/name. --args alone shows");
-        Console.WriteLine("  'name.exe <args>' instead of the PID. Add --pid to force the PID to show either way.");
-        Console.WriteLine("  If BOTH --where and --args are given, the main line is 'name.exe <args>' and the full");
-        Console.WriteLine("  path is shown on its own indented line underneath.");
+        WriteBodyLine("  By default (neither --where nor --args) the main line is '(PID)  name.exe'.");
+        WriteBodyLine("  --where alone shows the full path instead of the PID/name. --args alone shows");
+        WriteBodyLine("  'name.exe <args>' instead of the PID. Add --pid to force the PID to show either way.");
+        WriteBodyLine("  If BOTH --where and --args are given, the main line is 'name.exe <args>' and the full");
+        WriteBodyLine("  path is shown on its own indented line underneath.");
         Console.WriteLine();
-        Console.WriteLine("ENV FILTER FLAGS (each implies --env; accepts one or more values, OR'd together):");
-        Console.WriteLine("  --env-contains <value> [<value> ...]          (matches if NAME or VALUE contains it)");
-        Console.WriteLine("  --env-name-contains <value> [<value> ...]");
-        Console.WriteLine("  --env-name-starts-with <value> [<value> ...]");
-        Console.WriteLine("  --env-value-contains <value> [<value> ...]");
-        Console.WriteLine("  --env-value-starts-with <value> [<value> ...]");
+        WriteSectionHeader("ENV FILTER FLAGS (each implies --env; accepts one or more values, OR'd together):");
+        WriteBodyLine("  --env-contains <value> [<value> ...]          (matches if NAME or VALUE contains it)");
+        WriteBodyLine("  --env-name-contains <value> [<value> ...]");
+        WriteBodyLine("  --env-name-starts-with <value> [<value> ...]");
+        WriteBodyLine("  --env-value-contains <value> [<value> ...]");
+        WriteBodyLine("  --env-value-starts-with <value> [<value> ...]");
         Console.WriteLine();
-        Console.WriteLine("  Shorter aliases (--contains, --name-contains, --name-starts-with, --value-contains,");
-        Console.WriteLine("  --value-starts-with) are also accepted for all of the above.");
+        WriteBodyLine("  Shorter aliases (--contains, --name-contains, --name-starts-with, --value-contains,");
+        WriteBodyLine("  --value-starts-with) are also accepted for all of the above.");
         Console.WriteLine();
         Console.WriteLine("  A leftover positional token (not resolved to a process) also implies --env and acts");
         Console.WriteLine("  as an env-var NAME filter (see below).");
         Console.WriteLine();
-        Console.WriteLine("  When any env filter is active (--env-* flags or a leftover token), processes with NO");
-        Console.WriteLine("  matching environment variables are excluded from the whole list. Pass --all to");
-        Console.WriteLine("  override this and show every matched process regardless of env filter results.");
+        WriteBodyLine("  When any env filter is active (--env-* flags or a leftover token), processes with NO");
+        WriteBodyLine("  matching environment variables are excluded from the whole list. Pass --all to");
+        WriteBodyLine("  override this and show every matched process regardless of env filter results.");
         Console.WriteLine();
-        Console.WriteLine("EXAMPLE:");
-        Console.WriteLine("  px 12345");
-        Console.WriteLine("  px 12345 67890");
-        Console.WriteLine("  px chrome");
-        Console.WriteLine("  px chrome notepad");
-        Console.WriteLine("  px 'cyco*' --where");
-        Console.WriteLine("  px 'cyco*' --args");
-        Console.WriteLine("  px 'cyco*' --where --args");
-        Console.WriteLine("  px cycodd --env");
-        Console.WriteLine("  px cycodd CYCODD_DAEMON_CHILD    (implicit exact-match env var name filter, implies --env)");
-        Console.WriteLine("  px cycodd 'CYCODD_*'             (implicit glob env var name filter, implies --env)");
-        Console.WriteLine("  px cycodd --env-name-contains PATH TEMP");
-        Console.WriteLine("  px cycodd --env-value-contains localhost");
-        Console.WriteLine("  px cycodd --env-contains BLH     (matches if var NAME or VALUE contains 'BLH')");
+        WriteSectionHeader("EXAMPLE:");
+        WriteExampleLine("px 12345");
+        WriteExampleLine("px 12345 67890");
+        WriteExampleLine("px chrome");
+        WriteExampleLine("px chrome notepad");
+        WriteExampleLine("px 'cyco*' --where");
+        WriteExampleLine("px 'cyco*' --args");
+        WriteExampleLine("px 'cyco*' --where --args");
+        WriteExampleLine("px cycodd --env");
+        WriteExampleLine("px cycodd CYCODD_DAEMON_CHILD", "(implicit exact-match env var name filter, implies --env)");
+        WriteExampleLine("px cycodd 'CYCODD_*'", "(implicit glob env var name filter, implies --env)");
+        WriteExampleLine("px cycodd --env-name-contains PATH TEMP");
+        WriteExampleLine("px cycodd --env-value-contains localhost");
+        WriteExampleLine("px cycodd --env-contains BLH", "(matches if var NAME or VALUE contains 'BLH')");
+        WriteExampleLine("px cycodd --env-name-contains DAEMON --all", "(show every process, even ones with no match)");
     }
 
     static string GetProcessNameSafe(int pid)
