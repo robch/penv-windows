@@ -93,7 +93,7 @@ class Program
 
     static readonly string[] FilterFlags = new[]
     {
-        "--name-contains", "--name-starts-with", "--value-contains", "--value-starts-with"
+        "--contains", "--name-contains", "--name-starts-with", "--value-contains", "--value-starts-with"
     };
 
     static void PrintUsage()
@@ -118,6 +118,7 @@ class Program
         Console.WriteLine("    (no substring/prefix guessing otherwise)");
         Console.WriteLine();
         Console.WriteLine("FILTER FLAGS (each accepts one or more values, OR'd together with all other filters):");
+        Console.WriteLine("  --contains <value> [<value> ...]          (matches if NAME or VALUE contains it)");
         Console.WriteLine("  --name-contains <value> [<value> ...]");
         Console.WriteLine("  --name-starts-with <value> [<value> ...]");
         Console.WriteLine("  --value-contains <value> [<value> ...]");
@@ -132,6 +133,7 @@ class Program
         Console.WriteLine("  penv cycodd 'CYCODD_*'          (implicit glob env var name filter)");
         Console.WriteLine("  penv cycodd --name-contains PATH TEMP");
         Console.WriteLine("  penv cycodd --value-contains localhost");
+        Console.WriteLine("  penv cycodd --contains BLH      (matches if var NAME or VALUE contains 'BLH')");
     }
 
     static string GetProcessNameSafe(int pid)
@@ -149,6 +151,7 @@ class Program
     class ParsedArgs
     {
         public SortedSet<int> Pids = new SortedSet<int>();
+        public List<string> Contains = new List<string>();
         public List<string> NameContains = new List<string>();
         public List<string> NameStartsWith = new List<string>();
         public List<string> ValueContains = new List<string>();
@@ -161,6 +164,7 @@ class Program
         public List<string> UnresolvedTargets = new List<string>();
 
         public bool HasFilters =>
+            Contains.Count > 0 ||
             NameContains.Count > 0 || NameStartsWith.Count > 0 ||
             ValueContains.Count > 0 || ValueStartsWith.Count > 0 ||
             ImplicitFilters.Count > 0;
@@ -196,6 +200,7 @@ class Program
             {
                 var target = arg.ToLowerInvariant() switch
                 {
+                    "--contains" => result.Contains,
                     "--name-contains" => result.NameContains,
                     "--name-starts-with" => result.NameStartsWith,
                     "--value-contains" => result.ValueContains,
@@ -320,6 +325,7 @@ class Program
         if (!parsed.HasFilters)
             return true;
 
+        if (parsed.Contains.Any(f => name.IndexOf(f, StringComparison.OrdinalIgnoreCase) >= 0 || value.IndexOf(f, StringComparison.OrdinalIgnoreCase) >= 0)) return true;
         if (parsed.NameContains.Any(f => name.IndexOf(f, StringComparison.OrdinalIgnoreCase) >= 0)) return true;
         if (parsed.NameStartsWith.Any(f => name.StartsWith(f, StringComparison.OrdinalIgnoreCase))) return true;
         if (parsed.ValueContains.Any(f => value.IndexOf(f, StringComparison.OrdinalIgnoreCase) >= 0)) return true;
