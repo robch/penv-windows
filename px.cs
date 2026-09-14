@@ -131,8 +131,8 @@ class Program
         public static readonly AnsiColor Pid = new(0x98, 0xC3, 0x79);         // string (green)
         public static readonly AnsiColor Name = new(0x61, 0xAF, 0xEF);        // function (blue) - process base name
         public static readonly AnsiColor Subcommand = new(0xC6, 0x78, 0xDD); // keyword (purple) - first bare arg after exe
-        public static readonly AnsiColor OptName = new(0x61, 0xAF, 0xEF);     // function (blue) - option prefix + name
-        public static readonly AnsiColor OptValue = new(0xD1, 0x9A, 0x66);    // number/constant (orange) - option value
+        public static readonly AnsiColor OptName = new(0x56, 0xB6, 0xC2);     // operator (teal) - option prefix + name
+        public static readonly AnsiColor OptValue = new(0xAB, 0xB2, 0xBF);    // variable (light gray) - option value
         public static readonly AnsiColor QuotedString = new(0x98, 0xC3, 0x79); // string (green) - quoted args/values
         public static readonly AnsiColor EnvName = new(0xE0, 0x6C, 0x75);     // attribute (red)
         public static readonly AnsiColor EnvValue = new(0xAB, 0xB2, 0xBF);    // variable (light gray)
