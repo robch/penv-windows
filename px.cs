@@ -65,9 +65,9 @@ class Program
         public const ConsoleColor Pid = ConsoleColor.Green;
         public const ConsoleColor Name = ConsoleColor.Blue;
         public const ConsoleColor Path = ConsoleColor.Gray;
-        public const ConsoleColor Arg = ConsoleColor.Gray;
+        public const ConsoleColor Arg = ConsoleColor.DarkGray;
         public const ConsoleColor EnvName = ConsoleColor.Magenta;
-        public const ConsoleColor EnvValue = ConsoleColor.Gray;
+        public const ConsoleColor EnvValue = ConsoleColor.DarkGray;
         public const ConsoleColor Error = ConsoleColor.Red;
     }
 
@@ -630,20 +630,21 @@ class Program
                 .Select(pid =>
                 {
                     var details = detailsByPid[pid];
-                    var exeDisplay = parsed.ShowWhere && !string.IsNullOrEmpty(details.ImagePath)
+                    var usingPath = parsed.ShowWhere && !string.IsNullOrEmpty(details.ImagePath);
+                    var exeDisplay = usingPath
                         ? details.ImagePath
                         : GetProcessNameSafe(pid) + ".exe";
 
                     var argv = ParseCommandLine(details.CommandLine);
                     var restArgs = argv.Length > 1 ? argv.Skip(1).Select(EscapeArgumentForWindows).ToArray() : Array.Empty<string>();
-                    return (SortKey: exeDisplay, Exe: EscapeArgumentForWindows(exeDisplay), RestArgs: restArgs);
+                    return (SortKey: exeDisplay, Exe: EscapeArgumentForWindows(exeDisplay), UsingPath: usingPath, RestArgs: restArgs);
                 })
                 .OrderBy(e => e.SortKey, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
 
             foreach (var e in argEntries)
             {
-                Write(e.Exe, Colors.Path);
+                Write(e.Exe, e.UsingPath ? Colors.Path : Colors.Name);
                 foreach (var a in e.RestArgs)
                 {
                     Write(" ");
