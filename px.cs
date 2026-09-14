@@ -322,7 +322,7 @@ class Program
         "--value-contains", "--env-value-contains", "--value-starts-with", "--env-value-starts-with"
     };
 
-    static readonly string[] BooleanFlags = new[] { "--where", "--args", "--env", "--pid" };
+    static readonly string[] BooleanFlags = new[] { "--where", "--args", "--env", "--pid", "--all" };
 
     static void PrintUsage()
     {
@@ -370,6 +370,10 @@ class Program
         Console.WriteLine("  A leftover positional token (not resolved to a process) also implies --env and acts");
         Console.WriteLine("  as an env-var NAME filter (see below).");
         Console.WriteLine();
+        Console.WriteLine("  When any env filter is active (--env-* flags or a leftover token), processes with NO");
+        Console.WriteLine("  matching environment variables are excluded from the whole list. Pass --all to");
+        Console.WriteLine("  override this and show every matched process regardless of env filter results.");
+        Console.WriteLine();
         Console.WriteLine("EXAMPLE:");
         Console.WriteLine("  px 12345");
         Console.WriteLine("  px 12345 67890");
@@ -410,6 +414,7 @@ class Program
         public bool ShowArgs = false;
         public bool ShowEnvExplicit = false;
         public bool ShowPidExplicit = false;
+        public bool ShowAll = false;
 
         // Leftover tokens (not resolved to a process): matched against env var NAMES using
         // an exact-first progression (see CompileImplicitFilters), NOT contains/starts-with,
@@ -483,6 +488,13 @@ class Program
             if (argLower == "--pid")
             {
                 result.ShowPidExplicit = true;
+                i++;
+                continue;
+            }
+
+            if (argLower == "--all")
+            {
+                result.ShowAll = true;
                 i++;
                 continue;
             }
@@ -726,12 +738,49 @@ class Program
                 // shown, since the args themselves aren't a stable sort key).
                 var sortKey = parsed.ShowWhere && !string.IsNullOrEmpty(details.ImagePath) ? details.ImagePath : shortName;
 
-                return (Pid: pid, Details: details, ShortName: shortName, RestArgs: restArgs, SortKey: sortKey);
+                (string Raw, string Name, string Value)[] parsedVars = Array.Empty<(string, string, string)>();
+                int matchCount = 0;
+
+                if (parsed.ShouldShowEnv && string.IsNullOrEmpty(details.Error))
+                {
+                    var vars = details.EnvBlock.Split('\0').Where(v => !string.IsNullOrEmpty(v)).ToArray();
+                    Array.Sort(vars, StringComparer.OrdinalIgnoreCase);
+
+                    parsedVars = vars.Select(v =>
+                    {
+                        var eq = v.IndexOf('=', v.StartsWith("=") ? 1 : 0);
+                        var name = eq >= 0 ? v.Substring(0, eq) : v;
+                        var value = eq >= 0 ? v.Substring(eq + 1) : "";
+                        return (Raw: v, Name: name, Value: value);
+                    }).ToArray();
+
+                    var varNames = parsedVars.Select(pv => pv.Name).ToArray();
+                    var compiledImplicit = CompileImplicitFilters(parsed.ImplicitFilters, varNames);
+
+                    matchCount = parsed.ShowEnvAll
+                        ? parsedVars.Length
+                        : parsedVars.Count(pv => PassesFilters(parsed, pv.Name, pv.Value, compiledImplicit));
+                }
+
+                return (Pid: pid, Details: details, ShortName: shortName, RestArgs: restArgs, SortKey: sortKey,
+                        ParsedVars: parsedVars, EnvMatchCount: matchCount);
             })
             .OrderBy(e => e.SortKey, StringComparer.OrdinalIgnoreCase)
             .ToArray();
 
-        int pidDigits = entries.Length == 0 ? 0 : entries.Max(e => e.Pid.ToString().Length);
+        // When env filters are active (any --env-* flag or a leftover implicit filter token),
+        // exclude processes with zero matching environment variables from the whole list -
+        // unless --all is given to override this and show every matched process regardless.
+        if (parsed.HasFilters && !parsed.ShowAll)
+            entries = entries.Where(e => e.EnvMatchCount > 0).ToArray();
+
+        if (entries.Length == 0)
+        {
+            WriteLine("(no processes had environment variables matching the given filter(s); use --all to show them anyway)", Colors.Muted);
+            return;
+        }
+
+        int pidDigits = entries.Max(e => e.Pid.ToString().Length);
 
         foreach (var e in entries)
         {
@@ -786,26 +835,13 @@ class Program
                 continue;
             }
 
-            var vars = e.Details.EnvBlock.Split('\0').Where(v => !string.IsNullOrEmpty(v)).ToArray();
-            Array.Sort(vars, StringComparer.OrdinalIgnoreCase);
-
-            var parsedVars = vars.Select(v =>
-            {
-                var eq = v.IndexOf('=', v.StartsWith("=") ? 1 : 0);
-                var name = eq >= 0 ? v.Substring(0, eq) : v;
-                var value = eq >= 0 ? v.Substring(eq + 1) : "";
-                return (Raw: v, Name: name, Value: value);
-            }).ToArray();
-
-            var varNames = parsedVars.Select(pv => pv.Name).ToArray();
+            var varNames = e.ParsedVars.Select(pv => pv.Name).ToArray();
             var compiledImplicit = CompileImplicitFilters(parsed.ImplicitFilters, varNames);
 
-            int matchCount = 0;
-            foreach (var pv in parsedVars)
+            foreach (var pv in e.ParsedVars)
             {
                 if (parsed.ShowEnvAll || PassesFilters(parsed, pv.Name, pv.Value, compiledImplicit))
                 {
-                    matchCount++;
                     Write("  ");
                     Write(pv.Name, Colors.EnvName);
                     Write("=");
@@ -813,7 +849,7 @@ class Program
                 }
             }
 
-            if (matchCount == 0)
+            if (e.EnvMatchCount == 0)
                 WriteLine("  (no matching environment variables)", Colors.Muted);
 
             Console.WriteLine();
