@@ -592,10 +592,13 @@ class Program
 
             if (!parsed.ShouldShowEnv) continue;
 
+            Console.WriteLine();
+
             var details = detailsByPid[e.Pid];
             if (!string.IsNullOrEmpty(details.Error))
             {
                 WriteLine("  " + details.Error, Colors.Error);
+                Console.WriteLine();
                 continue;
             }
 
@@ -623,6 +626,8 @@ class Program
                     WriteLine(pv.Value, Colors.EnvValue);
                 }
             }
+
+            Console.WriteLine();
         }
 
         // --- 2. Optional: --args (uses FQN if --where was also given, else just the name) ---
