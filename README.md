@@ -21,7 +21,7 @@ memory. `px` does this by:
 ## Requirements
 
 - Windows, x64
-- .NET 8 SDK to build
+- .NET 10 SDK to build
 - You must have permission to read the target process's memory (this
   generally works for your own processes without elevation; for processes
   owned by other users you'll need to run elevated)
@@ -35,7 +35,7 @@ dotnet build
 The debug build output is:
 
 ```
-bin\Debug\net8.0\px.exe
+bin\Debug\net10.0\px.exe
 ```
 
 ## Usage
@@ -97,5 +97,5 @@ Clink or similar), you can add a snippet like this so `px` is
 automatically available whenever this repo is built:
 
 ```bat
-if exist C:\src\penv-windows\bin\Debug\net8.0\px.exe call :addpath "C:\src\penv-windows\bin\Debug\net8.0"
+if exist C:\src\penv-windows\bin\Debug\net10.0\px.exe call :addpath "C:\src\penv-windows\bin\Debug\net10.0"
 ```

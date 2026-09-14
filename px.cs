@@ -33,6 +33,43 @@ class Program
         return r;
     }
 
+    // --- Color helpers -----------------------------------------------------
+    // Mirrors the convention used elsewhere in the cycod family: skip coloring
+    // entirely when output is redirected (piped/logged), so captured output
+    // stays clean; otherwise, temporarily set ForegroundColor and restore it.
+
+    static void Write(string text, ConsoleColor? color = null)
+    {
+        if (color == null || Console.IsOutputRedirected)
+        {
+            Console.Write(text);
+            return;
+        }
+
+        var prev = Console.ForegroundColor;
+        Console.ForegroundColor = color.Value;
+        Console.Write(text);
+        Console.ForegroundColor = prev;
+    }
+
+    static void WriteLine(string text = "", ConsoleColor? color = null)
+    {
+        Write(text, color);
+        Console.WriteLine();
+    }
+
+    static class Colors
+    {
+        public const ConsoleColor Header = ConsoleColor.Cyan;
+        public const ConsoleColor Pid = ConsoleColor.DarkYellow;
+        public const ConsoleColor Path = ConsoleColor.White;
+        public const ConsoleColor Arg = ConsoleColor.DarkGray;
+        public const ConsoleColor SubHeader = ConsoleColor.DarkCyan;
+        public const ConsoleColor EnvName = ConsoleColor.Green;
+        public const ConsoleColor EnvValue = ConsoleColor.Gray;
+        public const ConsoleColor Error = ConsoleColor.Red;
+    }
+
     class ProcessDetails
     {
         public string EnvBlock = "";
@@ -219,7 +256,7 @@ class Program
 
     static void PrintUsage()
     {
-        Console.WriteLine("px - inspect running processes: list PIDs, exe paths, command lines, and env vars");
+        WriteLine("px - inspect running processes: list PIDs, exe paths, command lines, and env vars", Colors.Header);
         Console.WriteLine();
         Console.WriteLine("USAGE:");
         Console.WriteLine("  px <pid|process-name|name-fragment> [...] [<filter-value> ...] [<filter-flag> <value> [<value> ...]] ...");
@@ -516,7 +553,7 @@ class Program
 
         if (parsed.Pids.Count == 0)
         {
-            Console.WriteLine("ERROR: no PID and no running process matched any of the given names/fragments '" + string.Join("', '", parsed.UnresolvedTargets) + "'");
+            WriteLine("ERROR: no PID and no running process matched any of the given names/fragments '" + string.Join("', '", parsed.UnresolvedTargets) + "'", Colors.Error);
             return;
         }
 
@@ -541,14 +578,16 @@ class Program
         foreach (var e in listEntries)
         {
             var pidStr = ("(" + e.Pid + ")").PadRight(pidDigits + 2);
-            Console.WriteLine(pidStr + "  " + e.Display);
+            Write(pidStr, Colors.Pid);
+            Write("  ");
+            WriteLine(e.Display, Colors.Path);
         }
 
         // --- 2. Optional: --args (uses FQN if --where was also given, else just the name) ---
         if (parsed.ShowArgs)
         {
             Console.WriteLine();
-            Console.WriteLine("=== ARGS (executable + args) ===");
+            WriteLine("=== ARGS (executable + args) ===", Colors.Header);
 
             var argEntries = parsed.Pids
                 .Select(pid =>
@@ -559,32 +598,39 @@ class Program
                         : GetProcessNameSafe(pid) + ".exe";
 
                     var argv = ParseCommandLine(details.CommandLine);
-                    var restArgs = argv.Length > 1 ? argv.Skip(1) : Enumerable.Empty<string>();
-                    var line = EscapeArgumentForWindows(exeDisplay) + string.Concat(restArgs.Select(a => " " + EscapeArgumentForWindows(a)));
-                    return (SortKey: exeDisplay, Line: line);
+                    var restArgs = argv.Length > 1 ? argv.Skip(1).Select(EscapeArgumentForWindows).ToArray() : Array.Empty<string>();
+                    return (SortKey: exeDisplay, Exe: EscapeArgumentForWindows(exeDisplay), RestArgs: restArgs);
                 })
                 .OrderBy(e => e.SortKey, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
 
             foreach (var e in argEntries)
-                Console.WriteLine(e.Line);
+            {
+                Write(e.Exe, Colors.Path);
+                foreach (var a in e.RestArgs)
+                {
+                    Write(" ");
+                    Write(a, Colors.Arg);
+                }
+                Console.WriteLine();
+            }
         }
 
         // --- 3. Optional: environment variables, only if explicitly requested ---
         if (parsed.ShouldShowEnv)
         {
             Console.WriteLine();
-            Console.WriteLine("=== ENVIRONMENT VARIABLES ===");
+            WriteLine("=== ENVIRONMENT VARIABLES ===", Colors.Header);
 
             foreach (var pid in parsed.Pids)
             {
                 Console.WriteLine();
-                Console.WriteLine("--- PID " + pid + " (" + GetProcessNameSafe(pid) + ") ---");
+                WriteLine("--- PID " + pid + " (" + GetProcessNameSafe(pid) + ") ---", Colors.SubHeader);
                 var details = detailsByPid[pid];
 
                 if (!string.IsNullOrEmpty(details.Error))
                 {
-                    Console.WriteLine(details.Error);
+                    WriteLine(details.Error, Colors.Error);
                     continue;
                 }
 
@@ -605,7 +651,11 @@ class Program
                 foreach (var pv in parsedVars)
                 {
                     if (parsed.ShowEnvAll || PassesFilters(parsed, pv.Name, pv.Value, compiledImplicit))
-                        Console.WriteLine(pv.Raw);
+                    {
+                        Write(pv.Name, Colors.EnvName);
+                        Write("=");
+                        WriteLine(pv.Value, Colors.EnvValue);
+                    }
                 }
             }
         }
