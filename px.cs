@@ -61,11 +61,12 @@ class Program
     static class Colors
     {
         public const ConsoleColor Header = ConsoleColor.Cyan;
-        public const ConsoleColor Pid = ConsoleColor.DarkYellow;
-        public const ConsoleColor Path = ConsoleColor.White;
-        public const ConsoleColor Arg = ConsoleColor.DarkGray;
-        public const ConsoleColor SubHeader = ConsoleColor.DarkCyan;
-        public const ConsoleColor EnvName = ConsoleColor.Green;
+        public const ConsoleColor Paren = ConsoleColor.DarkGray;
+        public const ConsoleColor Pid = ConsoleColor.Green;
+        public const ConsoleColor Name = ConsoleColor.Blue;
+        public const ConsoleColor Path = ConsoleColor.Gray;
+        public const ConsoleColor Arg = ConsoleColor.Gray;
+        public const ConsoleColor EnvName = ConsoleColor.Magenta;
         public const ConsoleColor EnvValue = ConsoleColor.Gray;
         public const ConsoleColor Error = ConsoleColor.Red;
     }
@@ -561,7 +562,8 @@ class Program
         foreach (var pid in parsed.Pids)
             detailsByPid[pid] = GetProcessDetails(pid);
 
-        // --- 1. Primary list: (PID)  NAME, or (PID)  FQN if --where ---
+        // --- 1. Primary list: (PID)  NAME, or (PID)  FQN if --where. If env vars should be
+        //     shown, they're printed indented 2 spaces directly under each process's line. ---
         var listEntries = parsed.Pids
             .Select(pid =>
             {
@@ -569,7 +571,7 @@ class Program
                 var display = parsed.ShowWhere && !string.IsNullOrEmpty(details.ImagePath)
                     ? details.ImagePath
                     : GetProcessNameSafe(pid) + ".exe";
-                return (Pid: pid, Display: display);
+                return (Pid: pid, Display: display, UsingPath: parsed.ShowWhere && !string.IsNullOrEmpty(details.ImagePath));
             })
             .OrderBy(e => e.Display, StringComparer.OrdinalIgnoreCase)
             .ToArray();
@@ -577,17 +579,52 @@ class Program
         int pidDigits = listEntries.Length == 0 ? 0 : listEntries.Max(e => e.Pid.ToString().Length);
         foreach (var e in listEntries)
         {
-            var pidStr = ("(" + e.Pid + ")").PadRight(pidDigits + 2);
-            Write(pidStr, Colors.Pid);
+            var pidDigitsStr = e.Pid.ToString().PadLeft(pidDigits);
+            Write("(", Colors.Paren);
+            Write(pidDigitsStr, Colors.Pid);
+            Write(")", Colors.Paren);
             Write("  ");
-            WriteLine(e.Display, Colors.Path);
+            WriteLine(e.Display, e.UsingPath ? Colors.Path : Colors.Name);
+
+            if (!parsed.ShouldShowEnv) continue;
+
+            var details = detailsByPid[e.Pid];
+            if (!string.IsNullOrEmpty(details.Error))
+            {
+                WriteLine("  " + details.Error, Colors.Error);
+                continue;
+            }
+
+            var vars = details.EnvBlock.Split('\0').Where(v => !string.IsNullOrEmpty(v)).ToArray();
+            Array.Sort(vars, StringComparer.OrdinalIgnoreCase);
+
+            var parsedVars = vars.Select(v =>
+            {
+                var eq = v.IndexOf('=', v.StartsWith("=") ? 1 : 0);
+                var name = eq >= 0 ? v.Substring(0, eq) : v;
+                var value = eq >= 0 ? v.Substring(eq + 1) : "";
+                return (Raw: v, Name: name, Value: value);
+            }).ToArray();
+
+            var varNames = parsedVars.Select(pv => pv.Name).ToArray();
+            var compiledImplicit = CompileImplicitFilters(parsed.ImplicitFilters, varNames);
+
+            foreach (var pv in parsedVars)
+            {
+                if (parsed.ShowEnvAll || PassesFilters(parsed, pv.Name, pv.Value, compiledImplicit))
+                {
+                    Write("  ");
+                    Write(pv.Name, Colors.EnvName);
+                    Write("=");
+                    WriteLine(pv.Value, Colors.EnvValue);
+                }
+            }
         }
 
         // --- 2. Optional: --args (uses FQN if --where was also given, else just the name) ---
         if (parsed.ShowArgs)
         {
             Console.WriteLine();
-            WriteLine("=== ARGS (executable + args) ===", Colors.Header);
 
             var argEntries = parsed.Pids
                 .Select(pid =>
@@ -613,50 +650,6 @@ class Program
                     Write(a, Colors.Arg);
                 }
                 Console.WriteLine();
-            }
-        }
-
-        // --- 3. Optional: environment variables, only if explicitly requested ---
-        if (parsed.ShouldShowEnv)
-        {
-            Console.WriteLine();
-            WriteLine("=== ENVIRONMENT VARIABLES ===", Colors.Header);
-
-            foreach (var pid in parsed.Pids)
-            {
-                Console.WriteLine();
-                WriteLine("--- PID " + pid + " (" + GetProcessNameSafe(pid) + ") ---", Colors.SubHeader);
-                var details = detailsByPid[pid];
-
-                if (!string.IsNullOrEmpty(details.Error))
-                {
-                    WriteLine(details.Error, Colors.Error);
-                    continue;
-                }
-
-                var vars = details.EnvBlock.Split('\0').Where(v => !string.IsNullOrEmpty(v)).ToArray();
-                Array.Sort(vars, StringComparer.OrdinalIgnoreCase);
-
-                var parsedVars = vars.Select(v =>
-                {
-                    var eq = v.IndexOf('=', v.StartsWith("=") ? 1 : 0);
-                    var name = eq >= 0 ? v.Substring(0, eq) : v;
-                    var value = eq >= 0 ? v.Substring(eq + 1) : "";
-                    return (Raw: v, Name: name, Value: value);
-                }).ToArray();
-
-                var varNames = parsedVars.Select(pv => pv.Name).ToArray();
-                var compiledImplicit = CompileImplicitFilters(parsed.ImplicitFilters, varNames);
-
-                foreach (var pv in parsedVars)
-                {
-                    if (parsed.ShowEnvAll || PassesFilters(parsed, pv.Name, pv.Value, compiledImplicit))
-                    {
-                        Write(pv.Name, Colors.EnvName);
-                        Write("=");
-                        WriteLine(pv.Value, Colors.EnvValue);
-                    }
-                }
             }
         }
     }
