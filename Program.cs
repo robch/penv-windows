@@ -212,17 +212,17 @@ class Program
 
     static readonly string[] FilterFlags = new[]
     {
-        "--contains", "--name-contains", "--name-starts-with", "--value-contains", "--value-starts-with"
+        "--env-contains", "--env-name-contains", "--env-name-starts-with", "--env-value-contains", "--env-value-starts-with"
     };
 
-    static readonly string[] BooleanFlags = new[] { "--where", "--args" };
+    static readonly string[] BooleanFlags = new[] { "--where", "--args", "--env" };
 
     static void PrintUsage()
     {
-        Console.WriteLine("penv - print environment variables of a running process by PID or name fragment");
+        Console.WriteLine("px - inspect running processes: list PIDs, exe paths, command lines, and env vars");
         Console.WriteLine();
         Console.WriteLine("USAGE:");
-        Console.WriteLine("  penv <pid|process-name|name-fragment> [...] [<filter-value> ...] [<filter-flag> <value> [<value> ...]] ...");
+        Console.WriteLine("  px <pid|process-name|name-fragment> [...] [<filter-value> ...] [<filter-flag> <value> [<value> ...]] ...");
         Console.WriteLine();
         Console.WriteLine("HOW PROCESS TARGETS ARE RESOLVED (in order):");
         Console.WriteLine("  1. Numeric token           -> treated as a PID");
@@ -238,29 +238,36 @@ class Program
         Console.WriteLine("    3. Exact match (case-insensitive) -> used only if no case-sensitive match exists");
         Console.WriteLine("    (no substring/prefix guessing otherwise)");
         Console.WriteLine();
-        Console.WriteLine("FILTER FLAGS (each accepts one or more values, OR'd together with all other filters):");
-        Console.WriteLine("  --contains <value> [<value> ...]          (matches if NAME or VALUE contains it)");
-        Console.WriteLine("  --name-contains <value> [<value> ...]");
-        Console.WriteLine("  --name-starts-with <value> [<value> ...]");
-        Console.WriteLine("  --value-contains <value> [<value> ...]");
-        Console.WriteLine("  --value-starts-with <value> [<value> ...]");
-        Console.WriteLine();
         Console.WriteLine("OTHER FLAGS:");
-        Console.WriteLine("  --where   after normal output, also list the full path to each process's exe");
-        Console.WriteLine("  --args    after normal output, also list a runnable exe+args command line per process");
+        Console.WriteLine("  --where   show the full path to each process's executable (in the PID list, and in");
+        Console.WriteLine("            --args output if given)");
+        Console.WriteLine("  --args    after the PID list, also show a runnable exe+args command line per process");
+        Console.WriteLine("  --env     after everything else, show ALL environment variables for each process");
+        Console.WriteLine();
+        Console.WriteLine("ENV FILTER FLAGS (each implies --env; accepts one or more values, OR'd together):");
+        Console.WriteLine("  --env-contains <value> [<value> ...]          (matches if NAME or VALUE contains it)");
+        Console.WriteLine("  --env-name-contains <value> [<value> ...]");
+        Console.WriteLine("  --env-name-starts-with <value> [<value> ...]");
+        Console.WriteLine("  --env-value-contains <value> [<value> ...]");
+        Console.WriteLine("  --env-value-starts-with <value> [<value> ...]");
+        Console.WriteLine();
+        Console.WriteLine("  A leftover positional token (not resolved to a process) also implies --env and acts");
+        Console.WriteLine("  as an env-var NAME filter (see below).");
         Console.WriteLine();
         Console.WriteLine("EXAMPLE:");
-        Console.WriteLine("  penv 12345");
-        Console.WriteLine("  penv 12345 67890");
-        Console.WriteLine("  penv chrome");
-        Console.WriteLine("  penv chrome notepad");
-        Console.WriteLine("  penv cycodd CYCODD_DAEMON_CHILD (implicit exact-match env var name filter)");
-        Console.WriteLine("  penv cycodd 'CYCODD_*'          (implicit glob env var name filter)");
-        Console.WriteLine("  penv cycodd --name-contains PATH TEMP");
-        Console.WriteLine("  penv cycodd --value-contains localhost");
-        Console.WriteLine("  penv cycodd --contains BLH      (matches if var NAME or VALUE contains 'BLH')");
-        Console.WriteLine("  penv 'cyco*' --where");
-        Console.WriteLine("  penv 'cyco*' --args");
+        Console.WriteLine("  px 12345");
+        Console.WriteLine("  px 12345 67890");
+        Console.WriteLine("  px chrome");
+        Console.WriteLine("  px chrome notepad");
+        Console.WriteLine("  px 'cyco*' --where");
+        Console.WriteLine("  px 'cyco*' --args");
+        Console.WriteLine("  px 'cyco*' --where --args");
+        Console.WriteLine("  px cycodd --env");
+        Console.WriteLine("  px cycodd CYCODD_DAEMON_CHILD    (implicit exact-match env var name filter, implies --env)");
+        Console.WriteLine("  px cycodd 'CYCODD_*'             (implicit glob env var name filter, implies --env)");
+        Console.WriteLine("  px cycodd --env-name-contains PATH TEMP");
+        Console.WriteLine("  px cycodd --env-value-contains localhost");
+        Console.WriteLine("  px cycodd --env-contains BLH     (matches if var NAME or VALUE contains 'BLH')");
     }
 
     static string GetProcessNameSafe(int pid)
@@ -285,6 +292,7 @@ class Program
         public List<string> ValueStartsWith = new List<string>();
         public bool ShowWhere = false;
         public bool ShowArgs = false;
+        public bool ShowEnvExplicit = false;
 
         // Leftover tokens (not resolved to a process): matched against env var NAMES using
         // an exact-first progression (see CompileImplicitFilters), NOT contains/starts-with,
@@ -297,6 +305,13 @@ class Program
             NameContains.Count > 0 || NameStartsWith.Count > 0 ||
             ValueContains.Count > 0 || ValueStartsWith.Count > 0 ||
             ImplicitFilters.Count > 0;
+
+        // Env vars are shown if --env was given explicitly, OR any env filter (implicit or
+        // explicit --env-*) was given - filters imply you want to see the (filtered) env vars.
+        public bool ShouldShowEnv => ShowEnvExplicit || HasFilters;
+
+        // When --env is given with NO filters at all, show everything (unfiltered).
+        public bool ShowEnvAll => ShowEnvExplicit && !HasFilters;
     }
 
     static Regex GlobToRegex(string glob)
@@ -341,15 +356,22 @@ class Program
                 continue;
             }
 
+            if (argLower == "--env")
+            {
+                result.ShowEnvExplicit = true;
+                i++;
+                continue;
+            }
+
             if (Array.IndexOf(FilterFlags, argLower) >= 0)
             {
                 var target = arg.ToLowerInvariant() switch
                 {
-                    "--contains" => result.Contains,
-                    "--name-contains" => result.NameContains,
-                    "--name-starts-with" => result.NameStartsWith,
-                    "--value-contains" => result.ValueContains,
-                    "--value-starts-with" => result.ValueStartsWith,
+                    "--env-contains" => result.Contains,
+                    "--env-name-contains" => result.NameContains,
+                    "--env-name-starts-with" => result.NameStartsWith,
+                    "--env-value-contains" => result.ValueContains,
+                    "--env-value-starts-with" => result.ValueStartsWith,
                     _ => null
                 };
                 i++;
@@ -499,19 +521,73 @@ class Program
         }
 
         var detailsByPid = new Dictionary<int, ProcessDetails>();
-
         foreach (var pid in parsed.Pids)
-        {
-            Console.WriteLine("=== PID " + pid + " (" + GetProcessNameSafe(pid) + ") ===");
-            var details = GetProcessDetails(pid);
-            detailsByPid[pid] = details;
+            detailsByPid[pid] = GetProcessDetails(pid);
 
-            if (!string.IsNullOrEmpty(details.Error))
+        // --- 1. Primary list: (PID)  NAME, or (PID)  FQN if --where ---
+        var listEntries = parsed.Pids
+            .Select(pid =>
             {
-                Console.WriteLine(details.Error);
-            }
-            else
+                var details = detailsByPid[pid];
+                var display = parsed.ShowWhere && !string.IsNullOrEmpty(details.ImagePath)
+                    ? details.ImagePath
+                    : GetProcessNameSafe(pid) + ".exe";
+                return (Pid: pid, Display: display);
+            })
+            .OrderBy(e => e.Display, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        int pidDigits = listEntries.Length == 0 ? 0 : listEntries.Max(e => e.Pid.ToString().Length);
+        foreach (var e in listEntries)
+        {
+            var pidStr = ("(" + e.Pid + ")").PadRight(pidDigits + 2);
+            Console.WriteLine(pidStr + "  " + e.Display);
+        }
+
+        // --- 2. Optional: --args (uses FQN if --where was also given, else just the name) ---
+        if (parsed.ShowArgs)
+        {
+            Console.WriteLine();
+            Console.WriteLine("=== ARGS (executable + args) ===");
+
+            var argEntries = parsed.Pids
+                .Select(pid =>
+                {
+                    var details = detailsByPid[pid];
+                    var exeDisplay = parsed.ShowWhere && !string.IsNullOrEmpty(details.ImagePath)
+                        ? details.ImagePath
+                        : GetProcessNameSafe(pid) + ".exe";
+
+                    var argv = ParseCommandLine(details.CommandLine);
+                    var restArgs = argv.Length > 1 ? argv.Skip(1) : Enumerable.Empty<string>();
+                    var line = EscapeArgumentForWindows(exeDisplay) + string.Concat(restArgs.Select(a => " " + EscapeArgumentForWindows(a)));
+                    return (SortKey: exeDisplay, Line: line);
+                })
+                .OrderBy(e => e.SortKey, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+
+            foreach (var e in argEntries)
+                Console.WriteLine(e.Line);
+        }
+
+        // --- 3. Optional: environment variables, only if explicitly requested ---
+        if (parsed.ShouldShowEnv)
+        {
+            Console.WriteLine();
+            Console.WriteLine("=== ENVIRONMENT VARIABLES ===");
+
+            foreach (var pid in parsed.Pids)
             {
+                Console.WriteLine();
+                Console.WriteLine("--- PID " + pid + " (" + GetProcessNameSafe(pid) + ") ---");
+                var details = detailsByPid[pid];
+
+                if (!string.IsNullOrEmpty(details.Error))
+                {
+                    Console.WriteLine(details.Error);
+                    continue;
+                }
+
                 var vars = details.EnvBlock.Split('\0').Where(v => !string.IsNullOrEmpty(v)).ToArray();
                 Array.Sort(vars, StringComparer.OrdinalIgnoreCase);
 
@@ -528,51 +604,10 @@ class Program
 
                 foreach (var pv in parsedVars)
                 {
-                    if (PassesFilters(parsed, pv.Name, pv.Value, compiledImplicit))
+                    if (parsed.ShowEnvAll || PassesFilters(parsed, pv.Name, pv.Value, compiledImplicit))
                         Console.WriteLine(pv.Raw);
                 }
             }
-            Console.WriteLine();
-        }
-
-        if (parsed.ShowWhere)
-        {
-            var entries = detailsByPid
-                .Where(kv => !string.IsNullOrEmpty(kv.Value.ImagePath))
-                .Select(kv => (Pid: kv.Key, Path: kv.Value.ImagePath))
-                .OrderBy(e => e.Path, StringComparer.OrdinalIgnoreCase)
-                .ToArray();
-
-            Console.WriteLine();
-            Console.WriteLine("=== WHERE (full path to executable) ===");
-
-            int pidDigits = entries.Length == 0 ? 0 : entries.Max(e => e.Pid.ToString().Length);
-            foreach (var e in entries)
-            {
-                var pidStr = ("(" + e.Pid + ")").PadRight(pidDigits + 2);
-                Console.WriteLine(pidStr + "  " + e.Path);
-            }
-        }
-
-        if (parsed.ShowArgs)
-        {
-            var entries = detailsByPid
-                .Where(kv => !string.IsNullOrEmpty(kv.Value.ImagePath))
-                .Select(kv =>
-                {
-                    var argv = ParseCommandLine(kv.Value.CommandLine);
-                    var restArgs = argv.Length > 1 ? argv.Skip(1) : Enumerable.Empty<string>();
-                    var line = EscapeArgumentForWindows(kv.Value.ImagePath) + string.Concat(restArgs.Select(a => " " + EscapeArgumentForWindows(a)));
-                    return (Path: kv.Value.ImagePath, Line: line);
-                })
-                .OrderBy(e => e.Path, StringComparer.OrdinalIgnoreCase)
-                .ToArray();
-
-            Console.WriteLine();
-            Console.WriteLine("=== ARGS (executable + args, ready to run) ===");
-
-            foreach (var e in entries)
-                Console.WriteLine(e.Line);
         }
     }
 }

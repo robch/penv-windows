@@ -6,6 +6,9 @@ obj/
 Thumbs.db
 .DS_Store
 
+## Stray logs
+*.log
+
 ## Editor/IDE
 .vs/
 *.user
