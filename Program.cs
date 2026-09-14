@@ -20,6 +20,12 @@ class Program
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool CloseHandle(IntPtr h);
 
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern IntPtr CommandLineToArgvW(string cmdLine, out int numArgs);
+
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr LocalFree(IntPtr hMem);
+
     static byte[] SubArray(byte[] src, int offset, int len)
     {
         byte[] r = new byte[len];
@@ -27,33 +33,75 @@ class Program
         return r;
     }
 
-    static string GetEnv(int pid)
+    class ProcessDetails
     {
+        public string EnvBlock = "";
+        public string ImagePath = "";
+        public string CommandLine = "";
+        public string Error = ""; // empty = no error
+    }
+
+    // Reads a remote UNICODE_STRING given the local copy of its containing struct (ppBuf) and
+    // the byte offset within it where the UNICODE_STRING (Length:2, MaximumLength:2, pad:4, Buffer:8) starts.
+    static string ReadRemoteUnicodeString(IntPtr h, byte[] ppBuf, int offset)
+    {
+        ushort length = BitConverter.ToUInt16(ppBuf, offset);
+        if (length == 0) return "";
+
+        long bufAddr = BitConverter.ToInt64(ppBuf, offset + 8);
+        if (bufAddr == 0) return "";
+
+        byte[] buf = new byte[length];
+        int read;
+        if (!ReadProcessMemory(h, new IntPtr(bufAddr), buf, length, out read) || read <= 0) return "";
+
+        return Encoding.Unicode.GetString(buf, 0, read);
+    }
+
+    static ProcessDetails GetProcessDetails(int pid)
+    {
+        var details = new ProcessDetails();
+
         IntPtr h = OpenProcess(0x0410, false, pid); // PROCESS_QUERY_INFORMATION | PROCESS_VM_READ
         if (h == IntPtr.Zero)
         {
             int err = Marshal.GetLastWin32Error();
-            return "ERROR: OpenProcess failed, code=" + err;
+            details.Error = "ERROR: OpenProcess failed, code=" + err;
+            return details;
         }
         try
         {
             byte[] pbi = new byte[48];
             int retLen;
             int status = NtQueryInformationProcess(h, 0, pbi, pbi.Length, out retLen);
-            if (status != 0) return "ERROR: NtQueryInformationProcess status=" + status;
+            if (status != 0)
+            {
+                details.Error = "ERROR: NtQueryInformationProcess status=" + status;
+                return details;
+            }
 
             IntPtr pebAddr = new IntPtr(BitConverter.ToInt64(pbi, 8));
 
             byte[] pebBuf = new byte[0x150];
             int read;
             if (!ReadProcessMemory(h, pebAddr, pebBuf, pebBuf.Length, out read))
-                return "ERROR: ReadProcessMemory(PEB) failed, code=" + Marshal.GetLastWin32Error();
+            {
+                details.Error = "ERROR: ReadProcessMemory(PEB) failed, code=" + Marshal.GetLastWin32Error();
+                return details;
+            }
 
             IntPtr procParamsAddr = new IntPtr(BitConverter.ToInt64(pebBuf, 0x20));
 
             byte[] ppBuf = new byte[0x100];
             if (!ReadProcessMemory(h, procParamsAddr, ppBuf, ppBuf.Length, out read))
-                return "ERROR: ReadProcessMemory(ProcParams) failed, code=" + Marshal.GetLastWin32Error();
+            {
+                details.Error = "ERROR: ReadProcessMemory(ProcParams) failed, code=" + Marshal.GetLastWin32Error();
+                return details;
+            }
+
+            // RTL_USER_PROCESS_PARAMETERS (64-bit): ImagePathName UNICODE_STRING at 0x60, CommandLine at 0x70.
+            details.ImagePath = ReadRemoteUnicodeString(h, ppBuf, 0x60);
+            details.CommandLine = ReadRemoteUnicodeString(h, ppBuf, 0x70);
 
             IntPtr envAddr = new IntPtr(BitConverter.ToInt64(ppBuf, 0x80));
 
@@ -83,7 +131,8 @@ class Program
                 }
             }
 
-            return Encoding.Unicode.GetString(all);
+            details.EnvBlock = Encoding.Unicode.GetString(all);
+            return details;
         }
         finally
         {
@@ -91,10 +140,82 @@ class Program
         }
     }
 
+    // Parses a raw Win32 command-line string into argv, using the same rules the OS itself uses.
+    static string[] ParseCommandLine(string cmdLine)
+    {
+        if (string.IsNullOrEmpty(cmdLine)) return Array.Empty<string>();
+
+        int argc;
+        IntPtr argv = CommandLineToArgvW(cmdLine, out argc);
+        if (argv == IntPtr.Zero) return Array.Empty<string>();
+
+        try
+        {
+            var result = new string[argc];
+            for (int i = 0; i < argc; i++)
+            {
+                IntPtr strPtr = Marshal.ReadIntPtr(argv, i * IntPtr.Size);
+                result[i] = Marshal.PtrToStringUni(strPtr) ?? "";
+            }
+            return result;
+        }
+        finally
+        {
+            LocalFree(argv);
+        }
+    }
+
+    // Escapes a single argument per the standard Windows CommandLineToArgvW-compatible rules:
+    // backslashes are only special immediately before a '"', and must be doubled there (plus one
+    // more to escape the quote itself); a run of backslashes at the very end of the argument
+    // (right before the closing quote we add) must also be doubled.
+    static string EscapeArgumentForWindows(string arg)
+    {
+        if (arg.Length != 0 && arg.IndexOfAny(new[] { ' ', '\t', '\n', '\v', '"' }) < 0)
+            return arg;
+
+        var sb = new StringBuilder();
+        sb.Append('"');
+
+        for (int i = 0; i < arg.Length; )
+        {
+            int backslashes = 0;
+            while (i < arg.Length && arg[i] == '\\')
+            {
+                backslashes++;
+                i++;
+            }
+
+            if (i == arg.Length)
+            {
+                sb.Append('\\', backslashes * 2);
+                break;
+            }
+            else if (arg[i] == '"')
+            {
+                sb.Append('\\', backslashes * 2 + 1);
+                sb.Append('"');
+                i++;
+            }
+            else
+            {
+                sb.Append('\\', backslashes);
+                sb.Append(arg[i]);
+                i++;
+            }
+        }
+
+        sb.Append('"');
+        return sb.ToString();
+    }
+
+
     static readonly string[] FilterFlags = new[]
     {
         "--contains", "--name-contains", "--name-starts-with", "--value-contains", "--value-starts-with"
     };
+
+    static readonly string[] BooleanFlags = new[] { "--where", "--args" };
 
     static void PrintUsage()
     {
@@ -124,6 +245,10 @@ class Program
         Console.WriteLine("  --value-contains <value> [<value> ...]");
         Console.WriteLine("  --value-starts-with <value> [<value> ...]");
         Console.WriteLine();
+        Console.WriteLine("OTHER FLAGS:");
+        Console.WriteLine("  --where   after normal output, also list the full path to each process's exe");
+        Console.WriteLine("  --args    after normal output, also list a runnable exe+args command line per process");
+        Console.WriteLine();
         Console.WriteLine("EXAMPLE:");
         Console.WriteLine("  penv 12345");
         Console.WriteLine("  penv 12345 67890");
@@ -134,6 +259,8 @@ class Program
         Console.WriteLine("  penv cycodd --name-contains PATH TEMP");
         Console.WriteLine("  penv cycodd --value-contains localhost");
         Console.WriteLine("  penv cycodd --contains BLH      (matches if var NAME or VALUE contains 'BLH')");
+        Console.WriteLine("  penv 'cyco*' --where");
+        Console.WriteLine("  penv 'cyco*' --args");
     }
 
     static string GetProcessNameSafe(int pid)
@@ -156,6 +283,8 @@ class Program
         public List<string> NameStartsWith = new List<string>();
         public List<string> ValueContains = new List<string>();
         public List<string> ValueStartsWith = new List<string>();
+        public bool ShowWhere = false;
+        public bool ShowArgs = false;
 
         // Leftover tokens (not resolved to a process): matched against env var NAMES using
         // an exact-first progression (see CompileImplicitFilters), NOT contains/starts-with,
@@ -196,7 +325,23 @@ class Program
         {
             var arg = args[i];
 
-            if (Array.IndexOf(FilterFlags, arg.ToLowerInvariant()) >= 0)
+            var argLower = arg.ToLowerInvariant();
+
+            if (argLower == "--where")
+            {
+                result.ShowWhere = true;
+                i++;
+                continue;
+            }
+
+            if (argLower == "--args")
+            {
+                result.ShowArgs = true;
+                i++;
+                continue;
+            }
+
+            if (Array.IndexOf(FilterFlags, argLower) >= 0)
             {
                 var target = arg.ToLowerInvariant() switch
                 {
@@ -208,7 +353,9 @@ class Program
                     _ => null
                 };
                 i++;
-                while (i < args.Length && Array.IndexOf(FilterFlags, args[i].ToLowerInvariant()) < 0)
+                while (i < args.Length &&
+                       Array.IndexOf(FilterFlags, args[i].ToLowerInvariant()) < 0 &&
+                       Array.IndexOf(BooleanFlags, args[i].ToLowerInvariant()) < 0)
                 {
                     target!.Add(args[i]);
                     i++;
@@ -351,17 +498,21 @@ class Program
             return;
         }
 
+        var detailsByPid = new Dictionary<int, ProcessDetails>();
+
         foreach (var pid in parsed.Pids)
         {
             Console.WriteLine("=== PID " + pid + " (" + GetProcessNameSafe(pid) + ") ===");
-            string result = GetEnv(pid);
-            if (result.StartsWith("ERROR"))
+            var details = GetProcessDetails(pid);
+            detailsByPid[pid] = details;
+
+            if (!string.IsNullOrEmpty(details.Error))
             {
-                Console.WriteLine(result);
+                Console.WriteLine(details.Error);
             }
             else
             {
-                var vars = result.Split('\0').Where(v => !string.IsNullOrEmpty(v)).ToArray();
+                var vars = details.EnvBlock.Split('\0').Where(v => !string.IsNullOrEmpty(v)).ToArray();
                 Array.Sort(vars, StringComparer.OrdinalIgnoreCase);
 
                 var parsedVars = vars.Select(v =>
@@ -382,6 +533,46 @@ class Program
                 }
             }
             Console.WriteLine();
+        }
+
+        if (parsed.ShowWhere)
+        {
+            var entries = detailsByPid
+                .Where(kv => !string.IsNullOrEmpty(kv.Value.ImagePath))
+                .Select(kv => (Pid: kv.Key, Path: kv.Value.ImagePath))
+                .OrderBy(e => e.Path, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+
+            Console.WriteLine();
+            Console.WriteLine("=== WHERE (full path to executable) ===");
+
+            int pidDigits = entries.Length == 0 ? 0 : entries.Max(e => e.Pid.ToString().Length);
+            foreach (var e in entries)
+            {
+                var pidStr = ("(" + e.Pid + ")").PadRight(pidDigits + 2);
+                Console.WriteLine(pidStr + "  " + e.Path);
+            }
+        }
+
+        if (parsed.ShowArgs)
+        {
+            var entries = detailsByPid
+                .Where(kv => !string.IsNullOrEmpty(kv.Value.ImagePath))
+                .Select(kv =>
+                {
+                    var argv = ParseCommandLine(kv.Value.CommandLine);
+                    var restArgs = argv.Length > 1 ? argv.Skip(1) : Enumerable.Empty<string>();
+                    var line = EscapeArgumentForWindows(kv.Value.ImagePath) + string.Concat(restArgs.Select(a => " " + EscapeArgumentForWindows(a)));
+                    return (Path: kv.Value.ImagePath, Line: line);
+                })
+                .OrderBy(e => e.Path, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+
+            Console.WriteLine();
+            Console.WriteLine("=== ARGS (executable + args, ready to run) ===");
+
+            foreach (var e in entries)
+                Console.WriteLine(e.Line);
         }
     }
 }
