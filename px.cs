@@ -33,12 +33,66 @@ class Program
         return r;
     }
 
-    // --- Color helpers -----------------------------------------------------
-    // Mirrors the convention used elsewhere in the cycod family: skip coloring
-    // entirely when output is redirected (piped/logged), so captured output
-    // stays clean; otherwise, temporarily set ForegroundColor and restore it.
+    // --- True-color (24-bit RGB) support, borrowed from the cycodca Engine/AnsiColor.cs +
+    // Highlighter.cs pattern (Atom One Dark palette). Falls back to the nearest 16-color
+    // ConsoleColor on terminals that don't advertise true-color support, and skips coloring
+    // entirely when output is redirected either way.
 
-    static void Write(string text, ConsoleColor? color = null)
+    readonly struct AnsiColor
+    {
+        public readonly byte R, G, B;
+        public AnsiColor(int r, int g, int b) { R = (byte)r; G = (byte)g; B = (byte)b; }
+
+        public string FgEscape() => $"\x1b[38;2;{R};{G};{B}m";
+        public const string Reset = "\x1b[0m";
+
+        public ConsoleColor ToConsoleColor()
+        {
+            var best = ConsoleColor.Gray;
+            var bestDist = double.MaxValue;
+            foreach (var (cc, cr, cg, cb) in _vgaPalette)
+            {
+                double dr = R - cr, dg = G - cg, db = B - cb;
+                double d = dr * dr + dg * dg + db * db;
+                if (d < bestDist) { bestDist = d; best = cc; }
+            }
+            return best;
+        }
+
+        static readonly (ConsoleColor CC, byte R, byte G, byte B)[] _vgaPalette =
+        {
+            (ConsoleColor.Black, 0, 0, 0),
+            (ConsoleColor.DarkBlue, 0, 0, 128),
+            (ConsoleColor.DarkGreen, 0, 128, 0),
+            (ConsoleColor.DarkCyan, 0, 128, 128),
+            (ConsoleColor.DarkRed, 128, 0, 0),
+            (ConsoleColor.DarkMagenta, 128, 0, 128),
+            (ConsoleColor.DarkYellow, 128, 128, 0),
+            (ConsoleColor.Gray, 192, 192, 192),
+            (ConsoleColor.DarkGray, 128, 128, 128),
+            (ConsoleColor.Blue, 0, 0, 255),
+            (ConsoleColor.Green, 0, 255, 0),
+            (ConsoleColor.Cyan, 0, 255, 255),
+            (ConsoleColor.Red, 255, 0, 0),
+            (ConsoleColor.Magenta, 255, 0, 255),
+            (ConsoleColor.Yellow, 255, 255, 0),
+            (ConsoleColor.White, 255, 255, 255),
+        };
+    }
+
+    static readonly bool SupportsTrueColor = DetectTrueColor();
+
+    static bool DetectTrueColor()
+    {
+        var colorterm = Environment.GetEnvironmentVariable("COLORTERM");
+        if (colorterm is "truecolor" or "24bit") return true;
+        if (Environment.GetEnvironmentVariable("WT_SESSION") != null) return true;
+        var termProg = Environment.GetEnvironmentVariable("TERM_PROGRAM");
+        if (termProg is "iTerm.app" or "Hyper" or "vscode") return true;
+        return false;
+    }
+
+    static void Write(string text, AnsiColor? color = null)
     {
         if (color == null || Console.IsOutputRedirected)
         {
@@ -46,31 +100,44 @@ class Program
             return;
         }
 
-        var prev = Console.ForegroundColor;
-        Console.ForegroundColor = color.Value;
-        Console.Write(text);
-        Console.ForegroundColor = prev;
+        if (SupportsTrueColor)
+        {
+            Console.Write(color.Value.FgEscape());
+            Console.Write(text);
+            Console.Write(AnsiColor.Reset);
+        }
+        else
+        {
+            var prev = Console.ForegroundColor;
+            Console.ForegroundColor = color.Value.ToConsoleColor();
+            Console.Write(text);
+            Console.ForegroundColor = prev;
+        }
     }
 
-    static void WriteLine(string text = "", ConsoleColor? color = null)
+    static void WriteLine(string text = "", AnsiColor? color = null)
     {
         Write(text, color);
         Console.WriteLine();
     }
 
+    // Atom One Dark palette (https://github.com/atom/one-dark-syntax), reused here to give each
+    // kind of token (PID, path, option name/value, env name/value, ...) a distinct, semantically
+    // meaningful color instead of the flat 16-color palette.
     static class Colors
     {
-        public const ConsoleColor Header = ConsoleColor.Cyan;
-        public const ConsoleColor Paren = ConsoleColor.DarkGray;
-        public const ConsoleColor Pid = ConsoleColor.Green;
-        public const ConsoleColor Name = ConsoleColor.Blue;
-        public const ConsoleColor Path = ConsoleColor.DarkGray;
-        public const ConsoleColor Arg = ConsoleColor.DarkGray;
-        public const ConsoleColor EnvName = ConsoleColor.Yellow;
-        public const ConsoleColor EnvValue = ConsoleColor.DarkGray;
-        public const ConsoleColor Error = ConsoleColor.Red;
-        public const ConsoleColor OptName = ConsoleColor.Cyan;
-        public const ConsoleColor OptValue = ConsoleColor.DarkYellow;
+        public static readonly AnsiColor Header = new(0x61, 0xAF, 0xEF);      // function (blue)
+        public static readonly AnsiColor Muted = new(0x5C, 0x63, 0x70);       // comment (muted blue-gray) - parens, path dir/ext
+        public static readonly AnsiColor Pid = new(0x98, 0xC3, 0x79);         // string (green)
+        public static readonly AnsiColor Name = new(0x61, 0xAF, 0xEF);        // function (blue) - process base name
+        public static readonly AnsiColor Subcommand = new(0xC6, 0x78, 0xDD); // keyword (purple) - first bare arg after exe
+        public static readonly AnsiColor OptName = new(0x61, 0xAF, 0xEF);     // function (blue) - option prefix + name
+        public static readonly AnsiColor OptValue = new(0xD1, 0x9A, 0x66);    // number/constant (orange) - option value
+        public static readonly AnsiColor QuotedString = new(0x98, 0xC3, 0x79); // string (green) - quoted args/values
+        public static readonly AnsiColor Positional = new(0xAB, 0xB2, 0xBF); // variable (light gray) - bare non-subcommand args
+        public static readonly AnsiColor EnvName = new(0xE0, 0x6C, 0x75);     // attribute (red)
+        public static readonly AnsiColor EnvValue = new(0xAB, 0xB2, 0xBF);    // variable (light gray)
+        public static readonly AnsiColor Error = new(0xE0, 0x6C, 0x75);       // attribute/red
     }
 
     class ProcessDetails
@@ -562,9 +629,9 @@ class Program
         return false;
     }
 
-    // Writes a filesystem path with the directory portion and file extension in the "Path"
-    // color, and just the filename's base (no dir, no extension) in the "Name" color -
-    // e.g. C:\dir\ (gray) cycod (blue) .exe (gray).
+    // Writes a filesystem path with the directory portion and file extension muted, and just
+    // the filename's base (no dir, no extension) in the "Name" color -
+    // e.g. C:\dir\ (muted) cycod (blue) .exe (muted).
     static void WriteExePathColored(string display)
     {
         int lastSlash = display.LastIndexOfAny(new[] { '\\', '/' });
@@ -575,46 +642,54 @@ class Program
         string baseName = lastDot > 0 ? fileName.Substring(0, lastDot) : fileName;
         string ext = lastDot > 0 ? fileName.Substring(lastDot) : "";
 
-        Write(dirPart, Colors.Path);
+        Write(dirPart, Colors.Muted);
         Write(baseName, Colors.Name);
-        Write(ext, Colors.Path);
+        Write(ext, Colors.Muted);
     }
 
-    // Writes a single already-escaped command-line argument with "fancy" coloring: if it looks
-    // like an option (starts with --, -, or /), the option-name portion (up to the first '='
-    // or ':') is colored as OptName and any attached value after that is colored as OptValue.
-    // Bare positional arguments (no recognized option prefix) are colored as OptValue too.
-    static void WriteArgColored(string arg)
+    // Writes a single already-escaped command-line argument with "fancy" One-Dark-inspired
+    // coloring:
+    //   - quoted args (start with '"')                -> whole token in QuotedString (green)
+    //   - option-looking args (--, -, or / prefix)      -> prefix+name in OptName (blue),
+    //                                                       value after '='/':' in OptValue
+    //                                                       (orange), or QuotedString if the
+    //                                                       value itself is quoted
+    //   - the FIRST bare/positional arg after the exe   -> Subcommand (purple), as if it were
+    //                                                       a declaration/verb
+    //   - any later bare/positional arg                 -> Positional (light gray)
+    static void WriteArgColored(string arg, ref bool isFirstPositional)
     {
-        // Account for a possible leading quote (from EscapeArgumentForWindows) so we can still
-        // recognize the option prefix underneath it.
-        string prefix = "";
-        string rest = arg;
-        if (rest.StartsWith("\""))
+        if (arg.StartsWith("\""))
         {
-            prefix = "\"";
-            rest = rest.Substring(1);
+            Write(arg, Colors.QuotedString);
+            return;
         }
 
         string optPrefix =
-            rest.StartsWith("--") ? "--" :
-            rest.StartsWith("/") ? "/" :
-            rest.StartsWith("-") ? "-" :
+            arg.StartsWith("--") ? "--" :
+            arg.StartsWith("/") ? "/" :
+            arg.StartsWith("-") ? "-" :
             "";
 
         if (optPrefix == "")
         {
-            Write(arg, Colors.OptValue);
+            Write(arg, isFirstPositional ? Colors.Subcommand : Colors.Positional);
+            isFirstPositional = false;
             return;
         }
 
-        int splitAt = rest.IndexOfAny(new[] { '=', ':' });
-        string namePart = splitAt >= 0 ? rest.Substring(0, splitAt) : rest;
-        string valuePart = splitAt >= 0 ? rest.Substring(splitAt) : "";
+        int splitAt = arg.IndexOfAny(new[] { '=', ':' });
+        string namePart = splitAt >= 0 ? arg.Substring(0, splitAt) : arg;
+        string valuePart = splitAt >= 0 ? arg.Substring(splitAt) : "";
 
-        Write(prefix, Colors.Paren);
         Write(namePart, Colors.OptName);
-        Write(valuePart, Colors.OptValue);
+        if (valuePart.Length > 0)
+        {
+            var sep = valuePart[0];
+            var valueRest = valuePart.Substring(1);
+            Write(sep.ToString(), Colors.Muted);
+            Write(valueRest, valueRest.StartsWith("\"") ? Colors.QuotedString : Colors.OptValue);
+        }
     }
 
     static void Main(string[] args)
@@ -665,9 +740,9 @@ class Program
             if (showPid)
             {
                 var pidDigitsStr = e.Pid.ToString().PadLeft(pidDigits);
-                Write("(", Colors.Paren);
+                Write("(", Colors.Muted);
                 Write(pidDigitsStr, Colors.Pid);
-                Write(")", Colors.Paren);
+                Write(")", Colors.Muted);
                 Write("  ");
             }
 
@@ -675,10 +750,11 @@ class Program
             if (parsed.ShowArgs)
             {
                 Write(e.ShortName, Colors.Name);
+                bool isFirstPositional = true;
                 foreach (var a in e.RestArgs)
                 {
                     Write(" ");
-                    WriteArgColored(a);
+                    WriteArgColored(a, ref isFirstPositional);
                 }
             }
             else if (parsed.ShowWhere && !string.IsNullOrEmpty(e.Details.ImagePath))
@@ -696,7 +772,7 @@ class Program
             if (showLocationIndented && !string.IsNullOrEmpty(e.Details.ImagePath))
             {
                 Console.WriteLine();
-                WriteLine("  " + e.Details.ImagePath, Colors.Arg);
+                WriteLine("  " + e.Details.ImagePath, Colors.Muted);
                 Console.WriteLine();
             }
 
@@ -740,7 +816,7 @@ class Program
             }
 
             if (matchCount == 0)
-                WriteLine("  (no matching environment variables)", Colors.Arg);
+                WriteLine("  (no matching environment variables)", Colors.Muted);
 
             Console.WriteLine();
         }
