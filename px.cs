@@ -134,7 +134,6 @@ class Program
         public static readonly AnsiColor OptName = new(0x61, 0xAF, 0xEF);     // function (blue) - option prefix + name
         public static readonly AnsiColor OptValue = new(0xD1, 0x9A, 0x66);    // number/constant (orange) - option value
         public static readonly AnsiColor QuotedString = new(0x98, 0xC3, 0x79); // string (green) - quoted args/values
-        public static readonly AnsiColor Positional = new(0xAB, 0xB2, 0xBF); // variable (light gray) - bare non-subcommand args
         public static readonly AnsiColor EnvName = new(0xE0, 0x6C, 0x75);     // attribute (red)
         public static readonly AnsiColor EnvValue = new(0xAB, 0xB2, 0xBF);    // variable (light gray)
         public static readonly AnsiColor Error = new(0xE0, 0x6C, 0x75);       // attribute/red
@@ -648,16 +647,18 @@ class Program
     }
 
     // Writes a single already-escaped command-line argument with "fancy" One-Dark-inspired
-    // coloring:
-    //   - quoted args (start with '"')                -> whole token in QuotedString (green)
-    //   - option-looking args (--, -, or / prefix)      -> prefix+name in OptName (blue),
-    //                                                       value after '='/':' in OptValue
-    //                                                       (orange), or QuotedString if the
-    //                                                       value itself is quoted
-    //   - the FIRST bare/positional arg after the exe   -> Subcommand (purple), as if it were
-    //                                                       a declaration/verb
-    //   - any later bare/positional arg                 -> Positional (light gray)
-    static void WriteArgColored(string arg, ref bool isFirstPositional)
+    // coloring, tracking a single "seenOption" phase flag across the whole arg list:
+    //   - quoted args (start with '"')                -> always QuotedString (green), in
+    //                                                     either phase
+    //   - before the FIRST -, --, or / prefixed arg    -> bare/unquoted args are the leading
+    //                                                     "noun/verb" run (e.g. 'cycodd start')
+    //                                                     -> Subcommand (purple)
+    //   - once any -, --, or / prefixed arg is seen    -> we're in "option land" from then on:
+    //       - prefixed args   -> prefix+name in OptName (blue), value after '='/':' in
+    //                            OptValue (orange), or QuotedString if that value is quoted
+    //       - bare args       -> treated as a value for the preceding option (e.g. 'en-US'
+    //                            after '--lang') -> OptValue (orange)
+    static void WriteArgColored(string arg, ref bool seenOption)
     {
         if (arg.StartsWith("\""))
         {
@@ -665,18 +666,15 @@ class Program
             return;
         }
 
-        string optPrefix =
-            arg.StartsWith("--") ? "--" :
-            arg.StartsWith("/") ? "/" :
-            arg.StartsWith("-") ? "-" :
-            "";
+        bool isOption = arg.StartsWith("--") || arg.StartsWith("/") || arg.StartsWith("-");
 
-        if (optPrefix == "")
+        if (!isOption)
         {
-            Write(arg, isFirstPositional ? Colors.Subcommand : Colors.Positional);
-            isFirstPositional = false;
+            Write(arg, seenOption ? Colors.OptValue : Colors.Subcommand);
             return;
         }
+
+        seenOption = true;
 
         int splitAt = arg.IndexOfAny(new[] { '=', ':' });
         string namePart = splitAt >= 0 ? arg.Substring(0, splitAt) : arg;
@@ -750,11 +748,11 @@ class Program
             if (parsed.ShowArgs)
             {
                 Write(e.ShortName, Colors.Name);
-                bool isFirstPositional = true;
+                bool seenOption = false;
                 foreach (var a in e.RestArgs)
                 {
                     Write(" ");
-                    WriteArgColored(a, ref isFirstPositional);
+                    WriteArgColored(a, ref seenOption);
                 }
             }
             else if (parsed.ShowWhere && !string.IsNullOrEmpty(e.Details.ImagePath))
