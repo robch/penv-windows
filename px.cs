@@ -817,6 +817,18 @@ class Program
         }
     }
 
+    static int SafeConsoleWidth()
+    {
+        try
+        {
+            return Console.IsOutputRedirected ? 0 : Console.WindowWidth;
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
     static void Main(string[] args)
     {
         if (args.Length == 0)
@@ -897,11 +909,21 @@ class Program
 
         int pidDigits = entries.Max(e => e.Pid.ToString().Length);
 
+        // In "bare args" mode (--args given, but no --where location line and no env vars to
+        // separate entries), a single \n between processes isn't enough if a line wraps in the
+        // terminal - it becomes impossible to tell where one process's args end and the next
+        // one's PID/name begins. Detect that case and, if a given line's actual rendered width
+        // would exceed the console width, add an extra blank line after it.
+        bool bareArgsMode = parsed.ShowArgs && !showLocationIndented && !parsed.ShouldShowEnv;
+        int consoleWidth = SafeConsoleWidth();
+
         foreach (var e in entries)
         {
+            string pidPrefixPlain = "";
             if (showPid)
             {
                 var pidDigitsStr = e.Pid.ToString().PadLeft(pidDigits);
+                pidPrefixPlain = "(" + pidDigitsStr + ")  ";
                 Write("(", Colors.Muted);
                 Write(pidDigitsStr, Colors.Pid);
                 Write(")", Colors.Muted);
@@ -929,6 +951,13 @@ class Program
             }
 
             Console.WriteLine();
+
+            if (bareArgsMode)
+            {
+                var plainLine = pidPrefixPlain + e.ShortName + string.Concat(e.RestArgs.Select(a => " " + a));
+                if (consoleWidth > 0 && plainLine.Length > consoleWidth)
+                    Console.WriteLine();
+            }
 
             // --- Indented location line, only when both --args and --where are given ---
             if (showLocationIndented && !string.IsNullOrEmpty(e.Details.ImagePath))
