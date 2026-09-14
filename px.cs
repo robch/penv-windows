@@ -66,7 +66,7 @@ class Program
         public const ConsoleColor Name = ConsoleColor.Blue;
         public const ConsoleColor Path = ConsoleColor.Gray;
         public const ConsoleColor Arg = ConsoleColor.DarkGray;
-        public const ConsoleColor EnvName = ConsoleColor.Magenta;
+        public const ConsoleColor EnvName = ConsoleColor.Yellow;
         public const ConsoleColor EnvValue = ConsoleColor.DarkGray;
         public const ConsoleColor Error = ConsoleColor.Red;
     }
@@ -546,6 +546,24 @@ class Program
         return false;
     }
 
+    // Writes a filesystem path with the directory portion and file extension in the "Path"
+    // color, and just the filename's base (no dir, no extension) in the "Name" color -
+    // e.g. C:\dir\ (gray) cycod (blue) .exe (gray).
+    static void WriteExePathColored(string display)
+    {
+        int lastSlash = display.LastIndexOfAny(new[] { '\\', '/' });
+        string dirPart = lastSlash >= 0 ? display.Substring(0, lastSlash + 1) : "";
+        string fileName = lastSlash >= 0 ? display.Substring(lastSlash + 1) : display;
+
+        int lastDot = fileName.LastIndexOf('.');
+        string baseName = lastDot > 0 ? fileName.Substring(0, lastDot) : fileName;
+        string ext = lastDot > 0 ? fileName.Substring(lastDot) : "";
+
+        Write(dirPart, Colors.Path);
+        Write(baseName, Colors.Name);
+        Write(ext, Colors.Path);
+    }
+
     static void Main(string[] args)
     {
         if (args.Length == 0)
@@ -588,7 +606,8 @@ class Program
             Write(pidDigitsStr, Colors.Pid);
             Write(")", Colors.Paren);
             Write("  ");
-            WriteLine(e.Display, e.UsingPath ? Colors.Path : Colors.Name);
+            WriteExePathColored(e.Display);
+            Console.WriteLine();
 
             if (!parsed.ShouldShowEnv) continue;
 
@@ -616,16 +635,21 @@ class Program
             var varNames = parsedVars.Select(pv => pv.Name).ToArray();
             var compiledImplicit = CompileImplicitFilters(parsed.ImplicitFilters, varNames);
 
+            int matchCount = 0;
             foreach (var pv in parsedVars)
             {
                 if (parsed.ShowEnvAll || PassesFilters(parsed, pv.Name, pv.Value, compiledImplicit))
                 {
+                    matchCount++;
                     Write("  ");
                     Write(pv.Name, Colors.EnvName);
                     Write("=");
                     WriteLine(pv.Value, Colors.EnvValue);
                 }
             }
+
+            if (matchCount == 0)
+                WriteLine("  (no matching environment variables)", Colors.Arg);
 
             Console.WriteLine();
         }
@@ -646,14 +670,19 @@ class Program
 
                     var argv = ParseCommandLine(details.CommandLine);
                     var restArgs = argv.Length > 1 ? argv.Skip(1).Select(EscapeArgumentForWindows).ToArray() : Array.Empty<string>();
-                    return (SortKey: exeDisplay, Exe: EscapeArgumentForWindows(exeDisplay), UsingPath: usingPath, RestArgs: restArgs);
+                    return (SortKey: exeDisplay, RawExe: exeDisplay, UsingPath: usingPath, RestArgs: restArgs);
                 })
                 .OrderBy(e => e.SortKey, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
 
             foreach (var e in argEntries)
             {
-                Write(e.Exe, e.UsingPath ? Colors.Path : Colors.Name);
+                bool hasSpace = e.RawExe.IndexOfAny(new[] { ' ', '\t' }) >= 0;
+                if (hasSpace) Write("\"", Colors.Paren);
+                if (e.UsingPath) WriteExePathColored(e.RawExe);
+                else Write(e.RawExe, Colors.Name);
+                if (hasSpace) Write("\"", Colors.Paren);
+
                 foreach (var a in e.RestArgs)
                 {
                     Write(" ");
