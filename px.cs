@@ -545,6 +545,12 @@ class Program
         public bool ShowEnvAll => ShowEnvExplicit && !HasFilters;
     }
 
+    // Process.ProcessName never includes the ".exe" extension, so strip a trailing ".exe"
+    // (case-insensitive) from a token before comparing it against process names - lets
+    // 'px cycod.exe' work the same as 'px cycod'.
+    static string StripExeSuffix(string arg) =>
+        arg.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ? arg.Substring(0, arg.Length - 4) : arg;
+
     static Regex GlobToRegex(string glob)
     {
         var sb = new StringBuilder("^");
@@ -644,7 +650,7 @@ class Program
                 // regardless of whether other exact matches already exist). If it matches
                 // zero processes, don't discard it - let it fall through to "pending" so it
                 // can still be used as an env-var-name glob filter (e.g. 'CYCODD_*').
-                var regex = GlobToRegex(arg);
+                var regex = GlobToRegex(StripExeSuffix(arg));
                 var globMatches = allProcesses.Where(p => regex.IsMatch(p.ProcessName)).ToArray();
                 if (globMatches.Length > 0)
                 {
@@ -658,7 +664,7 @@ class Program
                 continue;
             }
 
-            var exactMatches = allProcesses.Where(p => string.Equals(p.ProcessName, arg, StringComparison.OrdinalIgnoreCase)).ToArray();
+            var exactMatches = allProcesses.Where(p => string.Equals(p.ProcessName, StripExeSuffix(arg), StringComparison.OrdinalIgnoreCase)).ToArray();
             if (exactMatches.Length > 0)
             {
                 foreach (var p in exactMatches) result.Pids.Add(p.Id);
@@ -679,7 +685,7 @@ class Program
             var stillPending = new List<string>();
             foreach (var arg in pending)
             {
-                var substringMatches = allProcesses.Where(p => p.ProcessName.IndexOf(arg, StringComparison.OrdinalIgnoreCase) >= 0).ToArray();
+                var substringMatches = allProcesses.Where(p => p.ProcessName.IndexOf(StripExeSuffix(arg), StringComparison.OrdinalIgnoreCase) >= 0).ToArray();
                 if (substringMatches.Length > 0)
                     foreach (var p in substringMatches) result.Pids.Add(p.Id);
                 else
