@@ -4,7 +4,8 @@
 running processes: resolve them by PID, exact name, name fragment, or glob;
 list their PIDs and executable names/paths; dump a ready-to-run command line
 (exe + properly re-escaped args); and print/filter their environment
-variables.
+variables. It can also launch a shell or command in a process's context, or
+rerun that process.
 
 Windows doesn't expose another process's environment block (or full
 command line) through normal tools like `tasklist` or PowerShell's
@@ -17,6 +18,37 @@ memory. `px` does this by:
 4. Reading `ProcessParameters` to get the `ImagePathName`, `CommandLine`,
    and `Environment` block pointers
 5. Reading each of those and printing/filtering the results
+
+## Process actions
+
+The PID-first action syntax uses the selected process's current working
+directory and environment:
+
+```text
+px <pid> shell
+px <pid> run [--] <command> [<arg> ...]
+px <pid> rerun
+```
+
+- `shell` walks up the process ancestry and starts a new instance of the nearest
+  recognized shell (`cmd`, `powershell`, `pwsh`, `bash`, `zsh`, `fish`, or
+  `sh`). The new shell uses the selected PID's context, not the ancestor's.
+- `run` starts the supplied command in the selected PID's context. The
+  conventional `--` separator is supported but optional.
+- `rerun` starts the selected process's original executable and arguments again
+  in its current context.
+
+Examples:
+
+```text
+px 32600 shell
+px 32600 run -- git status
+px 32600 run dotnet test
+px 32600 rerun
+```
+
+These operations reproduce launch context, not in-memory process state, open
+handles, shell-local aliases/functions, or other unexported state.
 
 ## Requirements
 

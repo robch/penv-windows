@@ -447,6 +447,17 @@ class Program
         Console.WriteLine();
         WriteSectionHeader("USAGE:");
         Console.WriteLine("  px <pid|process-name|name-fragment> [...] [<filter-value> ...] [<filter-flag> <value> [<value> ...]] ...");
+        Console.WriteLine("  px <pid> shell");
+        Console.WriteLine("  px <pid> run [--] <command> [<arg> ...]");
+        Console.WriteLine("  px <pid> rerun");
+        Console.WriteLine();
+        WriteSectionHeader("PROCESS ACTIONS:");
+        Console.WriteLine("  shell   start the nearest shell found in the process ancestry, using the target");
+        Console.WriteLine("          process's current directory and environment");
+        Console.WriteLine("  run     run a command using the target process's current directory and environment;");
+        Console.WriteLine("          the conventional -- separator is supported but optional");
+        Console.WriteLine("  rerun   run the target's original executable and arguments again, using its current");
+        Console.WriteLine("          directory and environment");
         Console.WriteLine();
         WriteSectionHeader("HOW PROCESS TARGETS ARE RESOLVED (in order):");
         Console.WriteLine("  1. Numeric token           -> treated as a PID");
@@ -515,6 +526,9 @@ class Program
         WriteBodyLine("  override this and show every matched process regardless of env filter results.");
         Console.WriteLine();
         WriteSectionHeader("EXAMPLE:");
+        WriteExampleLine("px 12345 shell", "(open the nearest ancestor shell in PID 12345's context)");
+        WriteExampleLine("px 12345 run -- git status", "(run git with PID 12345's cwd and environment)");
+        WriteExampleLine("px 12345 rerun", "(run PID 12345's original command again)");
         WriteExampleLine("px 12345");
         WriteExampleLine("px 12345 67890");
         WriteExampleLine("px chrome");
@@ -1123,14 +1137,197 @@ class Program
         }
     }
 
-    static void Main(string[] args)
+    static readonly HashSet<string> ShellProcessNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "cmd", "powershell", "pwsh", "bash", "zsh", "fish", "sh"
+    };
+
+    static Dictionary<string, string> ParseEnvironmentBlock(string environmentBlock)
+    {
+        var environment = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string entry in environmentBlock.Split('\0', StringSplitOptions.RemoveEmptyEntries))
+        {
+            // Win32 environment blocks can contain hidden entries such as "=C:=C:\\work".
+            // ProcessStartInfo does not accept those pseudo-variable names, and they are not
+            // ordinary environment variables inherited by applications.
+            int separator = entry.IndexOf('=', entry.StartsWith("=", StringComparison.Ordinal) ? 1 : 0);
+            if (separator <= 0) continue;
+            environment[entry.Substring(0, separator)] = entry.Substring(separator + 1);
+        }
+        return environment;
+    }
+
+    static string ExpandEnvironmentVariables(string value, IReadOnlyDictionary<string, string> environment)
+    {
+        return Regex.Replace(value, "%([^%]+)%", match =>
+            environment.TryGetValue(match.Groups[1].Value, out string expanded) ? expanded : match.Value);
+    }
+
+    static string ResolveExecutable(string command, ProcessDetails target, IReadOnlyDictionary<string, string> environment)
+    {
+        bool hasDirectory = command.IndexOfAny(new[] { '\\', '/' }) >= 0;
+        string[] extensions;
+        if (System.IO.Path.HasExtension(command))
+        {
+            extensions = new[] { "" };
+        }
+        else
+        {
+            string pathExt = environment.TryGetValue("PATHEXT", out string configuredPathExt)
+                ? configuredPathExt
+                : ".COM;.EXE;.BAT;.CMD";
+            extensions = new[] { "" }.Concat(pathExt.Split(';', StringSplitOptions.RemoveEmptyEntries)).ToArray();
+        }
+
+        IEnumerable<string> directories;
+        if (hasDirectory)
+        {
+            string candidate = System.IO.Path.IsPathRooted(command)
+                ? command
+                : System.IO.Path.Combine(target.CurrentDirectory, command);
+            directories = new[] { System.IO.Path.GetDirectoryName(candidate) ?? target.CurrentDirectory };
+            command = System.IO.Path.GetFileName(candidate);
+        }
+        else
+        {
+            string path = environment.TryGetValue("PATH", out string configuredPath) ? configuredPath : "";
+            directories = new[] { target.CurrentDirectory }
+                .Concat(path.Split(';', StringSplitOptions.RemoveEmptyEntries));
+        }
+
+        foreach (string directory in directories)
+        {
+            string expandedDirectory = ExpandEnvironmentVariables(directory.Trim().Trim('"'), environment);
+            foreach (string extension in extensions)
+            {
+                string candidate = System.IO.Path.Combine(expandedDirectory, command + extension);
+                if (System.IO.File.Exists(candidate)) return System.IO.Path.GetFullPath(candidate);
+            }
+        }
+
+        return command;
+    }
+
+    static int LaunchInProcessContext(ProcessDetails target, string executable, IEnumerable<string> arguments)
+    {
+        if (!string.IsNullOrEmpty(target.Error))
+        {
+            WriteLine(target.Error, Colors.Error);
+            return 1;
+        }
+        if (string.IsNullOrEmpty(target.CurrentDirectory) || string.IsNullOrEmpty(target.EnvBlock))
+        {
+            WriteLine("ERROR: could not read the target process's current directory or environment", Colors.Error);
+            return 1;
+        }
+
+        Dictionary<string, string> environment = ParseEnvironmentBlock(target.EnvBlock);
+        string resolvedExecutable = ResolveExecutable(executable, target, environment);
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = resolvedExecutable,
+            WorkingDirectory = target.CurrentDirectory,
+            UseShellExecute = false
+        };
+        startInfo.Environment.Clear();
+        foreach ((string name, string value) in environment)
+            startInfo.Environment[name] = value;
+        foreach (string argument in arguments)
+            startInfo.ArgumentList.Add(argument);
+
+        try
+        {
+            using Process child = Process.Start(startInfo);
+            if (child == null)
+            {
+                WriteLine("ERROR: failed to start '" + executable + "'", Colors.Error);
+                return 1;
+            }
+            child.WaitForExit();
+            return child.ExitCode;
+        }
+        catch (Exception ex)
+        {
+            WriteLine("ERROR: could not start '" + executable + "': " + ex.Message, Colors.Error);
+            return 1;
+        }
+    }
+
+    static int RunProcessAction(int pid, string action, string[] actionArguments)
+    {
+        ProcessDetails target = GetProcessDetails(pid);
+        if (!string.IsNullOrEmpty(target.Error))
+        {
+            WriteLine(target.Error, Colors.Error);
+            return 1;
+        }
+
+        if (action == "run")
+        {
+            int commandIndex = actionArguments.Length > 0 && actionArguments[0] == "--" ? 1 : 0;
+            if (commandIndex >= actionArguments.Length)
+            {
+                WriteLine("ERROR: 'run' requires a command", Colors.Error);
+                return 2;
+            }
+            return LaunchInProcessContext(target, actionArguments[commandIndex], actionArguments.Skip(commandIndex + 1));
+        }
+
+        if (action == "rerun")
+        {
+            if (actionArguments.Length != 0)
+            {
+                WriteLine("ERROR: 'rerun' does not accept arguments", Colors.Error);
+                return 2;
+            }
+            string[] originalArguments = ParseCommandLine(target.CommandLine);
+            if (string.IsNullOrEmpty(target.ImagePath))
+            {
+                WriteLine("ERROR: could not read the target process's executable path", Colors.Error);
+                return 1;
+            }
+            return LaunchInProcessContext(target, target.ImagePath, originalArguments.Skip(1));
+        }
+
+        if (actionArguments.Length != 0)
+        {
+            WriteLine("ERROR: 'shell' does not accept arguments; use 'run' to start a specific shell", Colors.Error);
+            return 2;
+        }
+
+        int currentPid = pid;
+        var visited = new HashSet<int>();
+        while (currentPid > 0 && visited.Add(currentPid))
+        {
+            string processName = GetProcessNameSafe(currentPid);
+            if (ShellProcessNames.Contains(processName))
+            {
+                ProcessDetails shell = currentPid == pid ? target : GetProcessDetails(currentPid);
+                if (!string.IsNullOrEmpty(shell.ImagePath))
+                    return LaunchInProcessContext(target, shell.ImagePath, Array.Empty<string>());
+            }
+            currentPid = GetParentPidOnly(currentPid);
+        }
+
+        WriteLine("ERROR: no supported shell was found in the process ancestry", Colors.Error);
+        return 1;
+    }
+
+    static int Main(string[] args)
     {
         try { Console.OutputEncoding = Encoding.UTF8; } catch { /* redirected/non-interactive output may not allow this */ }
 
         if (args.Length == 0)
         {
             PrintUsage();
-            return;
+            return 0;
+        }
+
+        if (args.Length >= 2 && int.TryParse(args[0], out int actionPid))
+        {
+            string action = args[1].ToLowerInvariant();
+            if (action is "shell" or "run" or "rerun")
+                return RunProcessAction(actionPid, action, args.Skip(2).ToArray());
         }
 
         var parsed = ParseArgs(args);
@@ -1138,7 +1335,7 @@ class Program
         if (parsed.Pids.Count == 0)
         {
             WriteLine("ERROR: no PID and no running process matched any of the given names/fragments '" + string.Join("', '", parsed.UnresolvedTargets) + "'", Colors.Error);
-            return;
+            return 1;
         }
 
         var detailsByPid = new Dictionary<int, ProcessDetails>();
@@ -1203,7 +1400,7 @@ class Program
         if (entries.Length == 0)
         {
             WriteLine("(no processes had environment variables matching the given filter(s); use --all to show them anyway)", Colors.Muted);
-            return;
+            return 0;
         }
 
         int pidDigits = entries.Max(e => e.Pid.ToString().Length);
@@ -1313,5 +1510,7 @@ class Program
             if (printTopList) Console.WriteLine();
             PrintForest(entries, parsed.ShowArgs, parsed.ShowCwd);
         }
+
+        return 0;
     }
 }
