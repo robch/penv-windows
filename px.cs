@@ -469,14 +469,15 @@ class Program
         WriteBodyLine("  --env     after everything else, show ALL environment variables for each process");
         WriteBodyLine("  --all     also show processes with no matching environment variables (see below)");
         WriteBodyLine("  --tree    show each matched process's full ancestry as a real tree (see below)");
-        WriteBodyLine("  --cwd     show the process's current working directory on an indented line");
+        WriteBodyLine("  --cwd     show the process's current working directory right on its main line");
         Console.WriteLine();
         WriteBodyLine("  By default (neither --where nor --args) the main line is '(PID)  name.exe'.");
         WriteBodyLine("  --where alone shows the full path instead of the PID/name. --args alone shows");
         WriteBodyLine("  'name.exe <args>' instead of the PID. Add --pid to force the PID to show either way.");
         WriteBodyLine("  If BOTH --where and --args are given, the main line is 'name.exe <args>' and the full");
-        WriteBodyLine("  path is shown on its own indented line underneath. --cwd adds a 'cwd: <path>' line to");
-        WriteBodyLine("  that same indented block (or creates its own if --where+--args aren't both given).");
+        WriteBodyLine("  path is shown on its own indented line underneath. --cwd appends '  (<cwd>)' right on");
+        WriteBodyLine("  the main line, after the args (or after the base name if no args) - this also means");
+        WriteBodyLine("  it shows up per-node when combined with --tree.");
         Console.WriteLine();
         WriteSectionHeader("TREE MODE (--tree):");
         WriteBodyLine("  Walks each matched process's ancestry (parent, grandparent, etc.) as far as it can be");
@@ -528,7 +529,7 @@ class Program
         WriteExampleLine("px cycodd --env-name-contains DAEMON --all", "(show every process, even ones with no match)");
         WriteExampleLine("px 'cyco*' --tree", "(show all matched processes as a single ancestry tree/forest)");
         WriteExampleLine("px cycodd --cwd", "(show each process's current working directory)");
-        WriteExampleLine("px cycodd --where --args --cwd", "(path + cwd together, indented under the args line)");
+        WriteExampleLine("px 'cyco*' --tree --cwd", "(cwd shown per-node in the tree too)");
     }
 
     static string GetProcessNameSafe(int pid)
@@ -585,6 +586,7 @@ class Program
         public ProcessDetails Details = new();
         public string ShortName = "";
         public string[] RestArgs = Array.Empty<string>();
+        public string Cwd = "";
         public string SortKey = "";
         public (string Raw, string Name, string Value)[] ParsedVars = Array.Empty<(string, string, string)>();
         public int EnvMatchCount;
@@ -944,12 +946,13 @@ class Program
         public bool IsMatched;      // true if this PID is one of the original matched/filtered entries
         public string Name = "";
         public string[] RestArgs = Array.Empty<string>();
+        public string Cwd = "";
         public bool HasParent = false;
         public int? DeadParentPid = null; // set when a parent PID was found but has since exited
         public List<TreeNode> Children = new();
     }
 
-    static (List<TreeNode> Trees, List<TreeNode> NoParent) BuildForest(MatchedEntry[] entries, bool includeArgs)
+    static (List<TreeNode> Trees, List<TreeNode> NoParent) BuildForest(MatchedEntry[] entries, bool includeArgs, bool includeCwd)
     {
         var nodesByPid = new Dictionary<int, TreeNode>();
 
@@ -967,6 +970,7 @@ class Program
             node.IsMatched = true;
             node.Name = e.ShortName;
             node.RestArgs = e.RestArgs;
+            node.Cwd = e.Cwd;
         }
 
         // Walk up from each matched PID, linking parent/child as we go, until we hit a dead
@@ -992,11 +996,16 @@ class Program
                 var parentNode = GetOrCreateNode(parentPid);
                 if (string.IsNullOrEmpty(parentNode.Name))
                 {
-                    if (includeArgs)
+                    if (includeArgs || includeCwd)
                     {
                         var det = GetProcessDetails(parentPid);
-                        var argv = ParseCommandLine(det.CommandLine);
-                        parentNode.RestArgs = argv.Length > 1 ? argv.Skip(1).Select(EscapeArgumentForWindows).ToArray() : Array.Empty<string>();
+                        if (includeArgs)
+                        {
+                            var argv = ParseCommandLine(det.CommandLine);
+                            parentNode.RestArgs = argv.Length > 1 ? argv.Skip(1).Select(EscapeArgumentForWindows).ToArray() : Array.Empty<string>();
+                        }
+                        if (includeCwd)
+                            parentNode.Cwd = det.CurrentDirectory;
                     }
                     parentNode.Name = GetProcessNameSafe(parentPid) + ".exe";
                 }
@@ -1015,7 +1024,18 @@ class Program
         return (trees, noParent);
     }
 
-    static void WriteTreeNodeLabel(TreeNode node, bool showArgs)
+    // Writes "  (<cwd>)" after a process's name/args, with the parens muted and the path itself
+    // in the QuotedString color (not actually quoted, just visually matching quoted values).
+    static void WriteCwdSuffix(string cwd)
+    {
+        if (string.IsNullOrEmpty(cwd)) return;
+        Write("  ");
+        Write("(", Colors.Muted);
+        Write(cwd, Colors.QuotedString);
+        Write(")", Colors.Muted);
+    }
+
+    static void WriteTreeNodeLabel(TreeNode node, bool showArgs, bool showCwd)
     {
         if (showArgs)
         {
@@ -1033,7 +1053,7 @@ class Program
         }
     }
 
-    static void PrintTreeNode(TreeNode node, string prefix, bool isLast, bool isRoot, bool showArgs)
+    static void PrintTreeNode(TreeNode node, string prefix, bool isLast, bool isRoot, bool showArgs, bool showCwd)
     {
         if (!isRoot)
         {
@@ -1045,22 +1065,23 @@ class Program
         Write(node.Pid.ToString(), node.IsMatched ? Colors.Pid : Colors.Muted);
         Write(")", Colors.Muted);
         Write("  ");
-        WriteTreeNodeLabel(node, showArgs);
+        WriteTreeNodeLabel(node, showArgs, showCwd);
+        if (showCwd) WriteCwdSuffix(node.Cwd);
         Console.WriteLine();
 
         var childPrefix = isRoot ? "" : prefix + (isLast ? "   " : "│  ");
         for (int i = 0; i < node.Children.Count; i++)
-            PrintTreeNode(node.Children[i], childPrefix, i == node.Children.Count - 1, isRoot: false, showArgs);
+            PrintTreeNode(node.Children[i], childPrefix, i == node.Children.Count - 1, isRoot: false, showArgs, showCwd);
     }
 
-    static void PrintForest(MatchedEntry[] entries, bool showArgs)
+    static void PrintForest(MatchedEntry[] entries, bool showArgs, bool showCwd)
     {
-        var (trees, noParent) = BuildForest(entries, showArgs);
+        var (trees, noParent) = BuildForest(entries, showArgs, showCwd);
 
         for (int i = 0; i < trees.Count; i++)
         {
             if (i > 0) Console.WriteLine();
-            PrintTreeNode(trees[i], "", true, isRoot: true, showArgs);
+            PrintTreeNode(trees[i], "", true, isRoot: true, showArgs, showCwd);
         }
 
         if (noParent.Count > 0)
@@ -1072,7 +1093,8 @@ class Program
                 Write(node.Pid.ToString(), Colors.Pid);
                 Write(")", Colors.Muted);
                 Write("  ");
-                WriteTreeNodeLabel(node, showArgs);
+                WriteTreeNodeLabel(node, showArgs, showCwd);
+                if (showCwd) WriteCwdSuffix(node.Cwd);
                 Write("  ");
                 if (node.DeadParentPid.HasValue)
                 {
@@ -1153,7 +1175,7 @@ class Program
 
                 return new MatchedEntry
                 {
-                    Pid = pid, Details = details, ShortName = shortName, RestArgs = restArgs, SortKey = sortKey,
+                    Pid = pid, Details = details, ShortName = shortName, RestArgs = restArgs, Cwd = details.CurrentDirectory, SortKey = sortKey,
                     ParsedVars = parsedVars, EnvMatchCount = matchCount
                 };
             })
@@ -1179,7 +1201,7 @@ class Program
         // terminal - it becomes impossible to tell where one process's args end and the next
         // one's PID/name begins. Detect that case and, if a given line's actual rendered width
         // would exceed the console width, add an extra blank line after it.
-        bool bareArgsMode = parsed.ShowArgs && !showLocationIndented && !parsed.ShowCwd && !parsed.ShouldShowEnv;
+        bool bareArgsMode = parsed.ShowArgs && !showLocationIndented && !parsed.ShouldShowEnv;
         int consoleWidth = SafeConsoleWidth();
 
         // When --tree is active, the top flat list is redundant UNLESS --where or env vars are
@@ -1221,6 +1243,9 @@ class Program
                 WriteExePathColored(e.ShortName);
             }
 
+            // --- cwd, right on the process line, after args (or after the base name if no args) ---
+            if (parsed.ShowCwd) WriteCwdSuffix(e.Cwd);
+
             Console.WriteLine();
 
             if (bareArgsMode)
@@ -1230,28 +1255,19 @@ class Program
                     Console.WriteLine();
             }
 
-            // --- Indented location/cwd block: path shown when --where+--args both given,
-            // cwd shown whenever --cwd is given. Both can appear together in one block.
+            // --- Indented location line, only when both --args and --where are given ---
             bool hasPathLine = showLocationIndented && !string.IsNullOrEmpty(e.Details.ImagePath);
-            bool hasCwdLine = parsed.ShowCwd && !string.IsNullOrEmpty(e.Details.CurrentDirectory);
-            if (hasPathLine || hasCwdLine)
+            if (hasPathLine)
             {
                 Console.WriteLine();
-                if (hasPathLine)
-                    WriteLine("  " + e.Details.ImagePath, Colors.Muted);
-                if (hasCwdLine)
-                {
-                    Write("  ");
-                    Write("cwd: ", Colors.OptName);
-                    WriteLine(e.Details.CurrentDirectory, Colors.Muted);
-                }
+                WriteLine("  " + e.Details.ImagePath, Colors.Muted);
                 Console.WriteLine();
             }
 
             // --- Env vars, only if explicitly requested or filtered ---
             if (!parsed.ShouldShowEnv) continue;
 
-            if (!(hasPathLine || hasCwdLine)) Console.WriteLine();
+            if (!hasPathLine) Console.WriteLine();
 
             if (!string.IsNullOrEmpty(e.Details.Error))
             {
@@ -1283,7 +1299,7 @@ class Program
         if (parsed.ShowTree)
         {
             if (printTopList) Console.WriteLine();
-            PrintForest(entries, parsed.ShowArgs);
+            PrintForest(entries, parsed.ShowArgs, parsed.ShowCwd);
         }
     }
 }
