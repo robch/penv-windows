@@ -2,36 +2,21 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
-using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
 
 class Program
 {
-    [DllImport("ntdll.dll")]
-    public static extern int NtQueryInformationProcess(IntPtr hProcess, int pic, byte[] pi, int piLen, out int retLen);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern IntPtr OpenProcess(int access, bool inherit, int pid);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern bool ReadProcessMemory(IntPtr hProcess, IntPtr addr, byte[] buffer, int size, out int bytesRead);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern bool CloseHandle(IntPtr h);
-
-    [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    public static extern IntPtr CommandLineToArgvW(string cmdLine, out int numArgs);
-
-    [DllImport("kernel32.dll")]
-    public static extern IntPtr LocalFree(IntPtr hMem);
-
-    static byte[] SubArray(byte[] src, int offset, int len)
-    {
-        byte[] r = new byte[len];
-        Array.Copy(src, offset, r, 0, len);
-        return r;
-    }
+    // The one platform-conditional seam: everything needed to inspect ANOTHER process's private
+    // state (env vars, raw command line, image path, cwd, parent pid) lives behind this
+    // interface, since Windows/Linux/macOS each expose it through totally different mechanisms.
+    // Everything else below (arg parsing/filtering, --tree building, colorized rendering,
+    // run/shell/rerun launching) is OS-agnostic and doesn't change per platform.
+    static readonly IProcessInspector Inspector =
+        OperatingSystem.IsWindows() ? new WindowsProcessInspector() :
+        OperatingSystem.IsLinux() ? new LinuxProcessInspector() :
+        OperatingSystem.IsMacOS() ? new MacProcessInspector() :
+        throw new PlatformNotSupportedException("px is not supported on this operating system.");
 
     // --- True-color (24-bit RGB) support, borrowed from the cycodca Engine/AnsiColor.cs +
     // Highlighter.cs pattern (Atom One Dark palette). Falls back to the nearest 16-color
@@ -138,193 +123,6 @@ class Program
         public static readonly AnsiColor EnvValue = new(0xAB, 0xB2, 0xBF);    // variable (light gray)
         public static readonly AnsiColor Error = new(0xE0, 0x6C, 0x75);       // attribute/red
     }
-
-    class ProcessDetails
-    {
-        public string EnvBlock = "";
-        public string ImagePath = "";
-        public string CommandLine = "";
-        public string CurrentDirectory = "";
-        public string Error = ""; // empty = no error
-        public int ParentPid = -1; // -1 = unknown/not read
-    }
-
-    // Reads a remote UNICODE_STRING given the local copy of its containing struct (ppBuf) and
-    // the byte offset within it where the UNICODE_STRING (Length:2, MaximumLength:2, pad:4, Buffer:8) starts.
-    static string ReadRemoteUnicodeString(IntPtr h, byte[] ppBuf, int offset)
-    {
-        ushort length = BitConverter.ToUInt16(ppBuf, offset);
-        if (length == 0) return "";
-
-        long bufAddr = BitConverter.ToInt64(ppBuf, offset + 8);
-        if (bufAddr == 0) return "";
-
-        byte[] buf = new byte[length];
-        int read;
-        if (!ReadProcessMemory(h, new IntPtr(bufAddr), buf, length, out read) || read <= 0) return "";
-
-        return Encoding.Unicode.GetString(buf, 0, read);
-    }
-
-    static ProcessDetails GetProcessDetails(int pid)
-    {
-        var details = new ProcessDetails();
-
-        IntPtr h = OpenProcess(0x0410, false, pid); // PROCESS_QUERY_INFORMATION | PROCESS_VM_READ
-        if (h == IntPtr.Zero)
-        {
-            int err = Marshal.GetLastWin32Error();
-            details.Error = "ERROR: OpenProcess failed, code=" + err;
-            return details;
-        }
-        try
-        {
-            byte[] pbi = new byte[48];
-            int retLen;
-            int status = NtQueryInformationProcess(h, 0, pbi, pbi.Length, out retLen);
-            if (status != 0)
-            {
-                details.Error = "ERROR: NtQueryInformationProcess status=" + status;
-                return details;
-            }
-
-            IntPtr pebAddr = new IntPtr(BitConverter.ToInt64(pbi, 8));
-
-            // PROCESS_BASIC_INFORMATION (64-bit): InheritedFromUniqueProcessId is the parent PID,
-            // at byte offset 40 (ExitStatus:8, PebBaseAddress:8, AffinityMask:8, BasePriority:8,
-            // UniqueProcessId:8, InheritedFromUniqueProcessId:8). Already have this data in pbi,
-            // no extra syscall needed.
-            details.ParentPid = (int)BitConverter.ToInt64(pbi, 40);
-
-            byte[] pebBuf = new byte[0x150];
-            int read;
-            if (!ReadProcessMemory(h, pebAddr, pebBuf, pebBuf.Length, out read))
-            {
-                details.Error = "ERROR: ReadProcessMemory(PEB) failed, code=" + Marshal.GetLastWin32Error();
-                return details;
-            }
-
-            IntPtr procParamsAddr = new IntPtr(BitConverter.ToInt64(pebBuf, 0x20));
-
-            byte[] ppBuf = new byte[0x100];
-            if (!ReadProcessMemory(h, procParamsAddr, ppBuf, ppBuf.Length, out read))
-            {
-                details.Error = "ERROR: ReadProcessMemory(ProcParams) failed, code=" + Marshal.GetLastWin32Error();
-                return details;
-            }
-
-            // RTL_USER_PROCESS_PARAMETERS (64-bit): CurrentDirectory.DosPath UNICODE_STRING at 0x38
-            // (part of the embedded CURDIR struct), ImagePathName at 0x60, CommandLine at 0x70.
-            details.CurrentDirectory = ReadRemoteUnicodeString(h, ppBuf, 0x38);
-            details.ImagePath = ReadRemoteUnicodeString(h, ppBuf, 0x60);
-            details.CommandLine = ReadRemoteUnicodeString(h, ppBuf, 0x70);
-
-            IntPtr envAddr = new IntPtr(BitConverter.ToInt64(ppBuf, 0x80));
-
-            int chunkSize = 4096;
-            byte[] all = new byte[0];
-            int totalRead = 0;
-            int maxTotal = 1024 * 1024;
-            bool foundEnd = false;
-            while (!foundEnd && totalRead < maxTotal)
-            {
-                byte[] chunk = new byte[chunkSize];
-                bool ok = ReadProcessMemory(h, new IntPtr(envAddr.ToInt64() + totalRead), chunk, chunkSize, out read);
-                if (!ok || read == 0) break;
-                byte[] newAll = new byte[all.Length + read];
-                Array.Copy(all, newAll, all.Length);
-                Array.Copy(chunk, 0, newAll, all.Length, read);
-                all = newAll;
-                totalRead += read;
-                for (int i = 0; i + 3 < all.Length; i += 2)
-                {
-                    if (all[i] == 0 && all[i + 1] == 0 && all[i + 2] == 0 && all[i + 3] == 0)
-                    {
-                        foundEnd = true;
-                        all = SubArray(all, 0, i + 2);
-                        break;
-                    }
-                }
-            }
-
-            details.EnvBlock = Encoding.Unicode.GetString(all);
-            return details;
-        }
-        finally
-        {
-            CloseHandle(h);
-        }
-    }
-
-    // Parses a raw Win32 command-line string into argv, using the same rules the OS itself uses.
-    static string[] ParseCommandLine(string cmdLine)
-    {
-        if (string.IsNullOrEmpty(cmdLine)) return Array.Empty<string>();
-
-        int argc;
-        IntPtr argv = CommandLineToArgvW(cmdLine, out argc);
-        if (argv == IntPtr.Zero) return Array.Empty<string>();
-
-        try
-        {
-            var result = new string[argc];
-            for (int i = 0; i < argc; i++)
-            {
-                IntPtr strPtr = Marshal.ReadIntPtr(argv, i * IntPtr.Size);
-                result[i] = Marshal.PtrToStringUni(strPtr) ?? "";
-            }
-            return result;
-        }
-        finally
-        {
-            LocalFree(argv);
-        }
-    }
-
-    // Escapes a single argument per the standard Windows CommandLineToArgvW-compatible rules:
-    // backslashes are only special immediately before a '"', and must be doubled there (plus one
-    // more to escape the quote itself); a run of backslashes at the very end of the argument
-    // (right before the closing quote we add) must also be doubled.
-    static string EscapeArgumentForWindows(string arg)
-    {
-        if (arg.Length != 0 && arg.IndexOfAny(new[] { ' ', '\t', '\n', '\v', '"' }) < 0)
-            return arg;
-
-        var sb = new StringBuilder();
-        sb.Append('"');
-
-        for (int i = 0; i < arg.Length; )
-        {
-            int backslashes = 0;
-            while (i < arg.Length && arg[i] == '\\')
-            {
-                backslashes++;
-                i++;
-            }
-
-            if (i == arg.Length)
-            {
-                sb.Append('\\', backslashes * 2);
-                break;
-            }
-            else if (arg[i] == '"')
-            {
-                sb.Append('\\', backslashes * 2 + 1);
-                sb.Append('"');
-                i++;
-            }
-            else
-            {
-                sb.Append('\\', backslashes);
-                sb.Append(arg[i]);
-                i++;
-            }
-        }
-
-        sb.Append('"');
-        return sb.ToString();
-    }
-
 
     static readonly string[] FilterFlags = new[]
     {
@@ -570,27 +368,6 @@ class Program
         new HashSet<int>(Process.GetProcesses().Select(p => p.Id)));
 
     static bool IsProcessAlive(int pid) => LivePids.Value.Contains(pid);
-
-    // Lightweight parent-PID lookup for ancestor-chain walking (--parents N/all): only opens
-    // the process and reads PROCESS_BASIC_INFORMATION, skipping the PEB/env-block work that
-    // GetProcessDetails does for the primary matched processes. Returns -1 on any failure.
-    static int GetParentPidOnly(int pid)
-    {
-        IntPtr h = OpenProcess(0x0400, false, pid); // PROCESS_QUERY_INFORMATION
-        if (h == IntPtr.Zero) return -1;
-        try
-        {
-            byte[] pbi = new byte[48];
-            int retLen;
-            int status = NtQueryInformationProcess(h, 0, pbi, pbi.Length, out retLen);
-            if (status != 0) return -1;
-            return (int)BitConverter.ToInt64(pbi, 40);
-        }
-        finally
-        {
-            CloseHandle(h);
-        }
-    }
 
 
 
@@ -1011,7 +788,7 @@ class Program
 
             while (!child.HasParent)
             {
-                int parentPid = GetParentPidOnly(child.Pid);
+                int parentPid = Inspector.GetParentPidOnly(child.Pid);
                 if (parentPid <= 0 || !visited.Add(parentPid)) break;
 
                 if (!IsProcessAlive(parentPid))
@@ -1025,11 +802,11 @@ class Program
                 {
                     if (includeArgs || includeCwd)
                     {
-                        var det = GetProcessDetails(parentPid);
+                        var det = Inspector.GetProcessDetails(parentPid);
                         if (includeArgs)
                         {
-                            var argv = ParseCommandLine(det.CommandLine);
-                            parentNode.RestArgs = argv.Length > 1 ? argv.Skip(1).Select(EscapeArgumentForWindows).ToArray() : Array.Empty<string>();
+                            var argv = Inspector.ParseCommandLine(det.CommandLine);
+                            parentNode.RestArgs = argv.Length > 1 ? argv.Skip(1).Select(Inspector.EscapeArgumentForDisplay).ToArray() : Array.Empty<string>();
                         }
                         if (includeCwd)
                             parentNode.Cwd = det.CurrentDirectory;
@@ -1255,7 +1032,7 @@ class Program
 
     static int RunProcessAction(int pid, string action, string[] actionArguments)
     {
-        ProcessDetails target = GetProcessDetails(pid);
+        ProcessDetails target = Inspector.GetProcessDetails(pid);
         if (!string.IsNullOrEmpty(target.Error))
         {
             WriteLine(target.Error, Colors.Error);
@@ -1280,7 +1057,7 @@ class Program
                 WriteLine("ERROR: 'rerun' does not accept arguments", Colors.Error);
                 return 2;
             }
-            string[] originalArguments = ParseCommandLine(target.CommandLine);
+            string[] originalArguments = Inspector.ParseCommandLine(target.CommandLine);
             if (string.IsNullOrEmpty(target.ImagePath))
             {
                 WriteLine("ERROR: could not read the target process's executable path", Colors.Error);
@@ -1302,11 +1079,11 @@ class Program
             string processName = GetProcessNameSafe(currentPid);
             if (ShellProcessNames.Contains(processName))
             {
-                ProcessDetails shell = currentPid == pid ? target : GetProcessDetails(currentPid);
+                ProcessDetails shell = currentPid == pid ? target : Inspector.GetProcessDetails(currentPid);
                 if (!string.IsNullOrEmpty(shell.ImagePath))
                     return LaunchInProcessContext(target, shell.ImagePath, Array.Empty<string>());
             }
-            currentPid = GetParentPidOnly(currentPid);
+            currentPid = Inspector.GetParentPidOnly(currentPid);
         }
 
         WriteLine("ERROR: no supported shell was found in the process ancestry", Colors.Error);
@@ -1340,7 +1117,7 @@ class Program
 
         var detailsByPid = new Dictionary<int, ProcessDetails>();
         foreach (var pid in parsed.Pids)
-            detailsByPid[pid] = GetProcessDetails(pid);
+            detailsByPid[pid] = Inspector.GetProcessDetails(pid);
 
         bool showPid = parsed.ShowPidExplicit || (!parsed.ShowLocation && !parsed.ShowArgs);
         bool showLocationIndented = parsed.ShowLocation && parsed.ShowArgs;
@@ -1350,8 +1127,8 @@ class Program
             {
                 var details = detailsByPid[pid];
                 var shortName = GetProcessNameSafe(pid) + ".exe";
-                var argv = ParseCommandLine(details.CommandLine);
-                var restArgs = argv.Length > 1 ? argv.Skip(1).Select(EscapeArgumentForWindows).ToArray() : Array.Empty<string>();
+                var argv = Inspector.ParseCommandLine(details.CommandLine);
+                var restArgs = argv.Length > 1 ? argv.Skip(1).Select(Inspector.EscapeArgumentForDisplay).ToArray() : Array.Empty<string>();
 
                 // Sort key matches what's actually relevant/visible: by full path only when
                 // --location is in effect, otherwise by the short name (even if --args is also

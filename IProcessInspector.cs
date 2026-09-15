@@ -1,0 +1,39 @@
+using System.Collections.Generic;
+
+// Everything px needs to know "about another process" that the OS doesn't hand you through
+// ordinary managed APIs (env vars, raw command line, image path, cwd, parent pid) lives behind
+// this seam. Windows, Linux, and macOS each expose this information through completely
+// different mechanisms (undocumented PEB reads, /proc files, and libproc/sysctl calls,
+// respectively) - but everything ABOVE this interface (arg parsing/filtering, --tree building,
+// colorized rendering, run/shell/rerun launching via Process.Start) is 100% OS-agnostic and
+// does not need to know which platform it's running on.
+interface IProcessInspector
+{
+    // Reads env block, raw command line, image path, cwd, and parent pid for the given process.
+    ProcessDetails GetProcessDetails(int pid);
+
+    // Lightweight parent-PID-only lookup, used for ancestor-chain walking (--tree) where the
+    // full env-block/PEB read would be wasted work.
+    int GetParentPidOnly(int pid);
+
+    // Splits a raw command-line string into argv, using whatever rule the target OS itself
+    // uses to do so. On Windows this re-parses a single string (CommandLineToArgvW rules);
+    // on Linux/macOS the OS already hands back an argv array (NUL-separated), so this is
+    // effectively a no-op/passthrough there.
+    string[] ParseCommandLine(string cmdLine);
+
+    // Escapes a single argument for round-trip display/rerun in a way that's safe to paste
+    // back into a shell on the current platform (Windows CommandLineToArgvW-compatible
+    // quoting vs. POSIX shell quoting).
+    string EscapeArgumentForDisplay(string arg);
+}
+
+class ProcessDetails
+{
+    public string EnvBlock = "";
+    public string ImagePath = "";
+    public string CommandLine = "";
+    public string CurrentDirectory = "";
+    public string Error = ""; // empty = no error
+    public int ParentPid = -1; // -1 = unknown/not read
+}
