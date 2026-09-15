@@ -1,34 +1,205 @@
 using System;
+using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
+using System.Text;
 
 // macOS has no /proc filesystem, so unlike Linux this needs its own native-API layer - similar
 // effort-level to the Windows PEB-reading, just against different (semi-)documented APIs:
 //
-//   Command line + environment: sysctl(CTL_KERN, KERN_PROCARGS2, pid) via P/Invoke into
-//                                libSystem/libc - returns argc followed by a NUL-separated
-//                                argv+environ blob that has to be walked manually (skip the
-//                                leading exec_path, then argc strings, then env strings to
-//                                the end of the buffer).
+//   Command line + environment: sysctl(CTL_KERN, KERN_PROCARGS2, pid) via P/Invoke into libc -
+//                                returns argc followed by a NUL-separated exec_path+argv+environ
+//                                blob that has to be walked manually.
 //   Image path:                  proc_pidpath() from libproc.
 //   Current working directory:   proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, ...) from libproc,
-//                                 reading pvi_cdir.vip_path.
-//   Parent pid:                  proc_pidinfo(pid, PROC_PIDTBSDINFO, ...) -> pbi_ppid, also
-//                                 from libproc (or kinfo_proc via sysctl KERN_PROC/KERN_PROC_PID).
+//                                 reading the embedded vip_path field.
+//   Parent pid:                  proc_pidinfo(pid, PROC_PIDTBSDINFO, ...) -> pbi_ppid.
 //
-// This is intentionally left unimplemented for now - stubbed so the rest of px (arg parsing,
-// filtering, --tree, colorized rendering, run/shell/rerun launching) can be verified unbroken
-// on Windows first, before wiring up the macOS path.
+// IMPORTANT - not yet verified on real hardware: this was written against the documented/stable
+// BSD kernel struct layouts (bsd/sys/proc_info.h in Apple's open-source xnu kernel), but without
+// a Mac available to cross-check with an actual `sizeof`/`offsetof` build. The KERN_PROCARGS2
+// parsing and the PROC_PIDTBSDINFO (pbi_ppid) offset are simple/stable and very likely correct
+// as-is. The PROC_PIDVNODEPATHINFO (cwd) offset math is the riskiest part - struct
+// proc_vnodepathinfo embeds a vinfo_stat whose exact byte size is the one number here most worth
+// double-checking on a real Mac (see ComputeCwdPathOffset below) - if it's off, --cwd will just
+// come back empty/garbled while everything else (env, cmdline, image path, ppid) still works,
+// since each piece is read and parsed independently.
 [SupportedOSPlatform("macos")]
 class MacProcessInspector : IProcessInspector
 {
+    const int CTL_KERN = 1;
+    const int KERN_PROCARGS2 = 49;
+    const int PROC_PIDTBSDINFO = 3;
+    const int PROC_PIDVNODEPATHINFO = 9;
+    const int MAXPATHLEN = 1024;
+
+    [DllImport("libc", SetLastError = true)]
+    static extern int sysctl(int[] mib, uint namelen, byte[] oldp, ref IntPtr oldlenp, IntPtr newp, IntPtr newlen);
+
+    [DllImport("libproc.dylib", SetLastError = true)]
+    static extern int proc_pidpath(int pid, byte[] buffer, uint buffersize);
+
+    [DllImport("libproc.dylib", SetLastError = true)]
+    static extern int proc_pidinfo(int pid, int flavor, ulong arg, byte[] buffer, int buffersize);
+
     public ProcessDetails GetProcessDetails(int pid)
     {
-        throw new NotImplementedException("macOS support is not implemented yet - see comments in MacProcessInspector.cs for the libproc/sysctl-based plan.");
+        var details = new ProcessDetails();
+
+        bool argsPermissionDenied = ReadArgsAndEnv(pid, out string cmdLine, out string envBlock);
+        details.CommandLine = cmdLine;
+        details.EnvBlock = envBlock;
+        details.ImagePath = ReadImagePath(pid);
+        details.CurrentDirectory = ReadCurrentDirectory(pid);
+        details.ParentPid = ReadParentPid(pid);
+
+        if (string.IsNullOrEmpty(details.CommandLine) && string.IsNullOrEmpty(details.ImagePath) &&
+            details.ParentPid <= 0)
+        {
+            details.Error = "ERROR: could not read process " + pid + " (process may have exited, or you may lack permission)";
+        }
+        else if (argsPermissionDenied)
+        {
+            details.Error = "ERROR: permission denied reading arguments/environment for process " + pid +
+                " (owned by another user - try sudo)";
+        }
+
+        return details;
     }
 
-    public int GetParentPidOnly(int pid)
+    public int GetParentPidOnly(int pid) => ReadParentPid(pid);
+
+    // KERN_PROCARGS2 buffer layout (well-documented/stable, used by `ps`, Activity Monitor-style
+    // tools, etc.): [ argc:int32 ][ exec_path NUL-terminated ][ NUL padding ]
+    //               [ argv[0] NUL-terminated ]...[ argv[argc-1] NUL-terminated ][ NUL padding ]
+    //               [ environ[0] NUL-terminated ]...[ to end of buffer ].
+    // Returns true if the sysctl call failed specifically due to a permission error (EPERM),
+    // as opposed to any other failure (process gone, etc).
+    static bool ReadArgsAndEnv(int pid, out string cmdLine, out string envBlock)
     {
-        throw new NotImplementedException("macOS support is not implemented yet - see comments in MacProcessInspector.cs for the libproc/sysctl-based plan.");
+        cmdLine = "";
+        envBlock = "";
+
+        var mib = new[] { CTL_KERN, KERN_PROCARGS2, pid };
+        IntPtr size = IntPtr.Zero;
+
+        // First call with a null buffer just to learn the required size.
+        if (sysctl(mib, 3, null, ref size, IntPtr.Zero, IntPtr.Zero) != 0 || size == IntPtr.Zero)
+            return Marshal.GetLastWin32Error() == 1; // EPERM == 1
+
+        byte[] buffer = new byte[size.ToInt32()];
+        if (sysctl(mib, 3, buffer, ref size, IntPtr.Zero, IntPtr.Zero) != 0)
+            return Marshal.GetLastWin32Error() == 1;
+
+        int total = size.ToInt32();
+        if (total < 4) return false;
+
+        int argc = BitConverter.ToInt32(buffer, 0);
+        int pos = 4;
+
+        // Skip the leading exec_path string (the resolved binary path - we already get this,
+        // more reliably, from proc_pidpath, so it's discarded here).
+        pos = SkipNulTerminatedString(buffer, pos, total);
+        pos = SkipNulPadding(buffer, pos, total);
+
+        var argvBuilder = new StringBuilder();
+        for (int i = 0; i < argc && pos < total; i++)
+        {
+            int start = pos;
+            pos = SkipNulTerminatedString(buffer, pos, total);
+            argvBuilder.Append(Encoding.UTF8.GetString(buffer, start, Math.Max(0, pos - start - 1)));
+            argvBuilder.Append('\0');
+        }
+        cmdLine = argvBuilder.ToString();
+
+        pos = SkipNulPadding(buffer, pos, total);
+
+        var envBuilder = new StringBuilder();
+        while (pos < total)
+        {
+            int start = pos;
+            pos = SkipNulTerminatedString(buffer, pos, total);
+            if (pos - start <= 1) break; // ran into trailing padding/empty - end of environ block
+            envBuilder.Append(Encoding.UTF8.GetString(buffer, start, pos - start - 1));
+            envBuilder.Append('\0');
+        }
+        envBlock = envBuilder.ToString();
+
+        return false;
+    }
+
+    static int SkipNulTerminatedString(byte[] buffer, int pos, int total)
+    {
+        while (pos < total && buffer[pos] != 0) pos++;
+        return Math.Min(pos + 1, total);
+    }
+
+    static int SkipNulPadding(byte[] buffer, int pos, int total)
+    {
+        while (pos < total && buffer[pos] == 0) pos++;
+        return pos;
+    }
+
+    static string ReadImagePath(int pid)
+    {
+        try
+        {
+            byte[] buffer = new byte[MAXPATHLEN];
+            int len = proc_pidpath(pid, buffer, (uint)buffer.Length);
+            return len > 0 ? Encoding.UTF8.GetString(buffer, 0, len) : "";
+        }
+        catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException)
+        {
+            return "";
+        }
+    }
+
+    // struct proc_bsdinfo (bsd/sys/proc_info.h): pbi_flags, pbi_status, pbi_xstatus, pbi_pid are
+    // each uint32_t (4 bytes), so pbi_ppid - the field we want - sits at a fixed byte offset of
+    // 16. This part of the struct hasn't changed across macOS versions and is the same approach
+    // Sysinternals-style/Activity-Monitor-style tools use, so this offset is low-risk.
+    const int ProcBsdInfoSize = 4 * 1024; // generous fixed-size buffer, larger than struct proc_bsdinfo actually needs
+    const int PbiPpidOffset = 16;
+
+    static int ReadParentPid(int pid)
+    {
+        try
+        {
+            byte[] buffer = new byte[ProcBsdInfoSize];
+            int ret = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, buffer, buffer.Length);
+            return ret > PbiPpidOffset + 4 ? BitConverter.ToInt32(buffer, PbiPpidOffset) : -1;
+        }
+        catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException)
+        {
+            return -1;
+        }
+    }
+
+    // struct proc_vnodepathinfo { struct vnode_fdinfowithpath pvi_cdir; ... } where
+    // vnode_fdinfowithpath embeds a vnode_info_path { struct vnode_info vip_vi; char
+    // vip_path[MAXPATHLEN]; } and vnode_info embeds a vinfo_stat (a fixed-size,
+    // platform-stable restatement of `struct stat`) followed by vi_type/vi_pad/vi_fsid.
+    // This byte offset to vip_path is the single riskiest number in this file - see the
+    // class-level comment. If --cwd comes back wrong/empty on real hardware, this is the
+    // first place to check (e.g. via a tiny native `offsetof` probe compiled on the target Mac).
+    const int CwdPathOffset = 152;
+
+    static string ReadCurrentDirectory(int pid)
+    {
+        try
+        {
+            byte[] buffer = new byte[8192];
+            int ret = proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, buffer, buffer.Length);
+            if (ret <= CwdPathOffset) return "";
+
+            int end = Array.IndexOf(buffer, (byte)0, CwdPathOffset, Math.Min(MAXPATHLEN, buffer.Length - CwdPathOffset));
+            if (end < 0) return "";
+
+            return Encoding.UTF8.GetString(buffer, CwdPathOffset, end - CwdPathOffset);
+        }
+        catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException or ArgumentOutOfRangeException)
+        {
+            return "";
+        }
     }
 
     // KERN_PROCARGS2 already hands back argv as discrete NUL-separated strings - no re-parsing
@@ -38,6 +209,20 @@ class MacProcessInspector : IProcessInspector
         return string.IsNullOrEmpty(cmdLine)
             ? Array.Empty<string>()
             : cmdLine.Split('\0', StringSplitOptions.RemoveEmptyEntries);
+    }
+
+    // /proc doesn't exist on macOS, but display-name-vs-truncated-comm is the same underlying
+    // concern as Linux: prefer the untruncated argv[0] from KERN_PROCARGS2 over the kernel's
+    // short name (which macOS also caps, via the same-spirit MAXCOMLEN limit as pbi_comm).
+    public string GetDisplayName(int pid)
+    {
+        ReadArgsAndEnv(pid, out string cmdLine, out _);
+        var argv = ParseCommandLine(cmdLine);
+        if (argv.Length > 0 && !string.IsNullOrEmpty(argv[0]))
+            return System.IO.Path.GetFileName(argv[0].TrimEnd('/'));
+
+        string imagePath = ReadImagePath(pid);
+        return !string.IsNullOrEmpty(imagePath) ? System.IO.Path.GetFileName(imagePath) : "?";
     }
 
     // Same POSIX shell-safe quoting rule as Linux.
