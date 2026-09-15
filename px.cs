@@ -536,18 +536,15 @@ class Program
         }
     }
 
-    static bool IsProcessAlive(int pid)
-    {
-        try
-        {
-            using var p = Process.GetProcessById(pid);
-            return !p.HasExited;
-        }
-        catch
-        {
-            return false;
-        }
-    }
+    // Cached once per run: the full snapshot of currently-running PIDs, from Process.GetProcesses().
+    // Used instead of opening each individual process handle to check aliveness, since
+    // Process.GetProcessById(pid).HasExited requires SYNCHRONIZE access - which can be denied for
+    // protected/system processes (e.g. a SYSTEM-owned svchost.exe) even when they ARE alive,
+    // causing them to be misreported as "exited" (dead parent) when they're not.
+    static readonly Lazy<HashSet<int>> LivePids = new(() =>
+        new HashSet<int>(Process.GetProcesses().Select(p => p.Id)));
+
+    static bool IsProcessAlive(int pid) => LivePids.Value.Contains(pid);
 
     // Lightweight parent-PID lookup for ancestor-chain walking (--parents N/all): only opens
     // the process and reads PROCESS_BASIC_INFORMATION, skipping the PEB/env-block work that
