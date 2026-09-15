@@ -145,6 +145,7 @@ class Program
         public string ImagePath = "";
         public string CommandLine = "";
         public string Error = ""; // empty = no error
+        public int ParentPid = -1; // -1 = unknown/not read
     }
 
     // Reads a remote UNICODE_STRING given the local copy of its containing struct (ppBuf) and
@@ -187,6 +188,12 @@ class Program
             }
 
             IntPtr pebAddr = new IntPtr(BitConverter.ToInt64(pbi, 8));
+
+            // PROCESS_BASIC_INFORMATION (64-bit): InheritedFromUniqueProcessId is the parent PID,
+            // at byte offset 40 (ExitStatus:8, PebBaseAddress:8, AffinityMask:8, BasePriority:8,
+            // UniqueProcessId:8, InheritedFromUniqueProcessId:8). Already have this data in pbi,
+            // no extra syscall needed.
+            details.ParentPid = (int)BitConverter.ToInt64(pbi, 40);
 
             byte[] pebBuf = new byte[0x150];
             int read;
@@ -322,7 +329,7 @@ class Program
         "--value-contains", "--env-value-contains", "--value-starts-with", "--env-value-starts-with"
     };
 
-    static readonly string[] BooleanFlags = new[] { "--where", "--args", "--env", "--pid", "--all" };
+    static readonly string[] BooleanFlags = new[] { "--where", "--args", "--env", "--pid", "--all", "--tree" };
 
     // --- Help-text colorizing helpers -----------------------------------------------------
 
@@ -458,12 +465,26 @@ class Program
         WriteBodyLine("  --args    show the process's command-line args (fancy-colored) on the main line");
         WriteBodyLine("  --env     after everything else, show ALL environment variables for each process");
         WriteBodyLine("  --all     also show processes with no matching environment variables (see below)");
+        WriteBodyLine("  --tree    show each matched process's full ancestry as a real tree (see below)");
         Console.WriteLine();
         WriteBodyLine("  By default (neither --where nor --args) the main line is '(PID)  name.exe'.");
         WriteBodyLine("  --where alone shows the full path instead of the PID/name. --args alone shows");
         WriteBodyLine("  'name.exe <args>' instead of the PID. Add --pid to force the PID to show either way.");
         WriteBodyLine("  If BOTH --where and --args are given, the main line is 'name.exe <args>' and the full");
         WriteBodyLine("  path is shown on its own indented line underneath.");
+        Console.WriteLine();
+        WriteSectionHeader("TREE MODE (--tree):");
+        WriteBodyLine("  Prints the normal process list first, then an additional '--- tree ---' section below");
+        WriteBodyLine("  it. Walks each matched process's ancestry (parent, grandparent, etc.) as far as it can");
+        WriteBodyLine("  be traced, merging shared ancestors so two matched processes under the same parent");
+        WriteBodyLine("  appear as two branches of one tree, not two separate trees. Distinct ancestries with");
+        WriteBodyLine("  no common ancestor are printed as separate root trees (a forest), each block separated");
+        WriteBodyLine("  by a blank line. Matched PIDs are shown in the PID color; ancestor-only PIDs are muted.");
+        WriteBodyLine("  If --args is also given, each tree node shows its command-line args too.");
+        Console.WriteLine();
+        WriteBodyLine("  A matched process whose parent has already exited (or has no parent at all) isn't");
+        WriteBodyLine("  shown as a trivial one-node tree - instead it's listed at the end with either");
+        WriteBodyLine("  '(dead parent <PID>)' (in red) or '(no parent)'.");
         Console.WriteLine();
         WriteSectionHeader("ENV FILTER FLAGS (each implies --env; accepts one or more values, OR'd together):");
         WriteBodyLine("  --env-contains <value> [<value> ...]          (matches if NAME or VALUE contains it)");
@@ -497,6 +518,7 @@ class Program
         WriteExampleLine("px cycodd --env-value-contains localhost");
         WriteExampleLine("px cycodd --env-contains BLH", "(matches if var NAME or VALUE contains 'BLH')");
         WriteExampleLine("px cycodd --env-name-contains DAEMON --all", "(show every process, even ones with no match)");
+        WriteExampleLine("px 'cyco*' --tree", "(show all matched processes as a single ancestry tree/forest)");
     }
 
     static string GetProcessNameSafe(int pid)
@@ -509,6 +531,56 @@ class Program
         {
             return "?";
         }
+    }
+
+    static bool IsProcessAlive(int pid)
+    {
+        try
+        {
+            using var p = Process.GetProcessById(pid);
+            return !p.HasExited;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    // Lightweight parent-PID lookup for ancestor-chain walking (--parents N/all): only opens
+    // the process and reads PROCESS_BASIC_INFORMATION, skipping the PEB/env-block work that
+    // GetProcessDetails does for the primary matched processes. Returns -1 on any failure.
+    static int GetParentPidOnly(int pid)
+    {
+        IntPtr h = OpenProcess(0x0400, false, pid); // PROCESS_QUERY_INFORMATION
+        if (h == IntPtr.Zero) return -1;
+        try
+        {
+            byte[] pbi = new byte[48];
+            int retLen;
+            int status = NtQueryInformationProcess(h, 0, pbi, pbi.Length, out retLen);
+            if (status != 0) return -1;
+            return (int)BitConverter.ToInt64(pbi, 40);
+        }
+        finally
+        {
+            CloseHandle(h);
+        }
+    }
+
+
+
+    // Named entry type for a resolved+filtered process, replacing the anonymous type previously
+    // returned by the LINQ projection - needed so tree mode can reference matched entries by PID
+    // when building the ancestor forest.
+    class MatchedEntry
+    {
+        public int Pid;
+        public ProcessDetails Details = new();
+        public string ShortName = "";
+        public string[] RestArgs = Array.Empty<string>();
+        public string SortKey = "";
+        public (string Raw, string Name, string Value)[] ParsedVars = Array.Empty<(string, string, string)>();
+        public int EnvMatchCount;
     }
 
     class ParsedArgs
@@ -524,6 +596,7 @@ class Program
         public bool ShowEnvExplicit = false;
         public bool ShowPidExplicit = false;
         public bool ShowAll = false;
+        public bool ShowTree = false;
 
         // Leftover tokens (not resolved to a process): matched against env var NAMES using
         // an exact-first progression (see CompileImplicitFilters), NOT contains/starts-with,
@@ -610,6 +683,13 @@ class Program
             if (argLower == "--all")
             {
                 result.ShowAll = true;
+                i++;
+                continue;
+            }
+
+            if (argLower == "--tree")
+            {
+                result.ShowTree = true;
                 i++;
                 continue;
             }
@@ -829,8 +909,175 @@ class Program
         }
     }
 
+    // --- Tree mode (--tree): build a real ancestry tree/forest out of the matched PIDs -------
+    //
+    // For each matched PID, walk up via GetParentPidOnly() until we hit a PID that's exited
+    // (dead parents are NOT included as nodes - we simply treat that PID as if it had no
+    // parent at all, since there's nothing meaningful left to show about it), has no further
+    // parent, or that we've already seen (cycle guard). Any PID visited along the way (matched
+    // or merely a still-alive ancestor) becomes a node; nodes are merged by PID so that two
+    // matched processes sharing an ancestor produce ONE tree with two leaves, not two separate
+    // trees. The result is a forest: one root per distinct ancestry line that has no further
+    // living parent to climb to. Roots that have at least one child are printed as trees, each
+    // separated by a blank line. Matched PIDs that end up as childless roots (no live parent,
+    // and nothing else chains up through them) are NOT printed as their own trivial one-node
+    // trees - they're collected and listed separately at the end under "no parent".
+
+    class TreeNode
+    {
+        public int Pid;
+        public bool IsMatched;      // true if this PID is one of the original matched/filtered entries
+        public string Name = "";
+        public string[] RestArgs = Array.Empty<string>();
+        public bool HasParent = false;
+        public int? DeadParentPid = null; // set when a parent PID was found but has since exited
+        public List<TreeNode> Children = new();
+    }
+
+    static (List<TreeNode> Trees, List<TreeNode> NoParent) BuildForest(MatchedEntry[] entries, bool includeArgs)
+    {
+        var nodesByPid = new Dictionary<int, TreeNode>();
+
+        TreeNode GetOrCreateNode(int pid)
+        {
+            if (nodesByPid.TryGetValue(pid, out var existing)) return existing;
+            var node = new TreeNode { Pid = pid };
+            nodesByPid[pid] = node;
+            return node;
+        }
+
+        foreach (var e in entries)
+        {
+            var node = GetOrCreateNode(e.Pid);
+            node.IsMatched = true;
+            node.Name = e.ShortName;
+            node.RestArgs = e.RestArgs;
+        }
+
+        // Walk up from each matched PID, linking parent/child as we go, until we hit a dead
+        // (exited) parent - recorded on the child as DeadParentPid but not added as a node in
+        // its own right, since there's nothing meaningful left to show about it - a PID with
+        // no further parent, or one we've already climbed through (cycle guard against PID reuse).
+        foreach (var e in entries)
+        {
+            var child = nodesByPid[e.Pid];
+            var visited = new HashSet<int> { child.Pid };
+
+            while (!child.HasParent)
+            {
+                int parentPid = GetParentPidOnly(child.Pid);
+                if (parentPid <= 0 || !visited.Add(parentPid)) break;
+
+                if (!IsProcessAlive(parentPid))
+                {
+                    child.DeadParentPid = parentPid;
+                    break;
+                }
+
+                var parentNode = GetOrCreateNode(parentPid);
+                if (string.IsNullOrEmpty(parentNode.Name))
+                {
+                    if (includeArgs)
+                    {
+                        var det = GetProcessDetails(parentPid);
+                        var argv = ParseCommandLine(det.CommandLine);
+                        parentNode.RestArgs = argv.Length > 1 ? argv.Skip(1).Select(EscapeArgumentForWindows).ToArray() : Array.Empty<string>();
+                    }
+                    parentNode.Name = GetProcessNameSafe(parentPid) + ".exe";
+                }
+
+                child.HasParent = true;
+                if (!parentNode.Children.Contains(child))
+                    parentNode.Children.Add(child);
+
+                child = parentNode;
+            }
+        }
+
+        var roots = nodesByPid.Values.Where(n => !n.HasParent).OrderBy(n => n.Name, StringComparer.OrdinalIgnoreCase).ToList();
+        var trees = roots.Where(n => n.Children.Count > 0).ToList();
+        var noParent = roots.Where(n => n.Children.Count == 0 && n.IsMatched).OrderBy(n => n.Name, StringComparer.OrdinalIgnoreCase).ToList();
+        return (trees, noParent);
+    }
+
+    static void WriteTreeNodeLabel(TreeNode node, bool showArgs)
+    {
+        if (showArgs)
+        {
+            Write(node.Name, Colors.Name);
+            bool seenOption = false;
+            foreach (var a in node.RestArgs)
+            {
+                Write(" ");
+                WriteArgColored(a, ref seenOption);
+            }
+        }
+        else
+        {
+            WriteExePathColored(node.Name);
+        }
+    }
+
+    static void PrintTreeNode(TreeNode node, string prefix, bool isLast, bool isRoot, bool showArgs)
+    {
+        if (!isRoot)
+        {
+            Write(prefix, Colors.Muted);
+            Write(isLast ? "└─ " : "├─ ", Colors.Muted);
+        }
+
+        Write("(", Colors.Muted);
+        Write(node.Pid.ToString(), node.IsMatched ? Colors.Pid : Colors.Muted);
+        Write(")", Colors.Muted);
+        Write("  ");
+        WriteTreeNodeLabel(node, showArgs);
+        Console.WriteLine();
+
+        var childPrefix = isRoot ? "" : prefix + (isLast ? "   " : "│  ");
+        for (int i = 0; i < node.Children.Count; i++)
+            PrintTreeNode(node.Children[i], childPrefix, i == node.Children.Count - 1, isRoot: false, showArgs);
+    }
+
+    static void PrintForest(MatchedEntry[] entries, bool showArgs)
+    {
+        var (trees, noParent) = BuildForest(entries, showArgs);
+
+        for (int i = 0; i < trees.Count; i++)
+        {
+            if (i > 0) Console.WriteLine();
+            PrintTreeNode(trees[i], "", true, isRoot: true, showArgs);
+        }
+
+        if (noParent.Count > 0)
+        {
+            if (trees.Count > 0) Console.WriteLine();
+            foreach (var node in noParent)
+            {
+                Write("(", Colors.Muted);
+                Write(node.Pid.ToString(), Colors.Pid);
+                Write(")", Colors.Muted);
+                Write("  ");
+                WriteTreeNodeLabel(node, showArgs);
+                Write("  ");
+                if (node.DeadParentPid.HasValue)
+                {
+                    Write("(dead parent ", Colors.Muted);
+                    Write(node.DeadParentPid.Value.ToString(), Colors.Error);
+                    Write(")", Colors.Muted);
+                    Console.WriteLine();
+                }
+                else
+                {
+                    WriteLine("(no parent)", Colors.Muted);
+                }
+            }
+        }
+    }
+
     static void Main(string[] args)
     {
+        try { Console.OutputEncoding = Encoding.UTF8; } catch { /* redirected/non-interactive output may not allow this */ }
+
         if (args.Length == 0)
         {
             PrintUsage();
@@ -889,8 +1136,11 @@ class Program
                         : parsedVars.Count(pv => PassesFilters(parsed, pv.Name, pv.Value, compiledImplicit));
                 }
 
-                return (Pid: pid, Details: details, ShortName: shortName, RestArgs: restArgs, SortKey: sortKey,
-                        ParsedVars: parsedVars, EnvMatchCount: matchCount);
+                return new MatchedEntry
+                {
+                    Pid = pid, Details = details, ShortName = shortName, RestArgs = restArgs, SortKey = sortKey,
+                    ParsedVars = parsedVars, EnvMatchCount = matchCount
+                };
             })
             .OrderBy(e => e.SortKey, StringComparer.OrdinalIgnoreCase)
             .ToArray();
@@ -997,6 +1247,14 @@ class Program
                 WriteLine("  (no matching environment variables)", Colors.Muted);
 
             Console.WriteLine();
+        }
+
+        if (parsed.ShowTree)
+        {
+            Console.WriteLine();
+            WriteLine("--- tree ---", Colors.Header);
+            Console.WriteLine();
+            PrintForest(entries, parsed.ShowArgs);
         }
     }
 }
