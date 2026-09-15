@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Runtime.Versioning;
+using System.Text;
 
 // Linux exposes everything px needs directly as files under /proc/<pid>/, with no elevation
 // needed for your own processes (same-user access to others' is normally allowed too; root
@@ -10,27 +11,98 @@ using System.Runtime.Versioning;
 //                          already parses on Windows (ParseEnvironmentBlock in px.cs works as-is)
 //   /proc/<pid>/cmdline  - NUL-separated argv, already split by the kernel (no CommandLineToArgvW
 //                          equivalent needed - ParseCommandLine becomes a trivial Split('\0'))
-//   /proc/<pid>/cwd      - symlink; File.ResolveLinkTarget / readlink gives the current directory
+//   /proc/<pid>/cwd      - symlink; resolves to the current working directory
 //   /proc/<pid>/exe      - symlink; resolves to the on-disk executable path
 //   /proc/<pid>/stat     - whitespace-separated fields; field 4 (1-indexed) is the parent pid
 //                          (careful: field 2, the comm name, is parenthesized and may itself
 //                          contain spaces/parens, so it can't be split naively - skip past the
 //                          last ')' first)
-//
-// This is intentionally left unimplemented for now - stubbed so the rest of px (arg parsing,
-// filtering, --tree, colorized rendering, run/shell/rerun launching) can be verified unbroken
-// on Windows first, before wiring up the Linux path.
 [SupportedOSPlatform("linux")]
 class LinuxProcessInspector : IProcessInspector
 {
     public ProcessDetails GetProcessDetails(int pid)
     {
-        throw new NotImplementedException("Linux support is not implemented yet - see comments in LinuxProcessInspector.cs for the /proc-based plan.");
+        var details = new ProcessDetails();
+        string procDir = "/proc/" + pid;
+
+        if (!Directory.Exists(procDir))
+        {
+            details.Error = "ERROR: no such process " + pid;
+            return details;
+        }
+
+        // /proc/<pid>/environ and /proc/<pid>/cmdline: NUL-separated entries. Kept in the exact
+        // same "NAME=VALUE\0NAME=VALUE\0..." / "arg0\0arg1\0..." shape the rest of px already
+        // expects (ParseEnvironmentBlock in px.cs splits EnvBlock on '\0'; ParseCommandLine below
+        // does the same for CommandLine) - identical to what the Windows PEB reader produces.
+        details.EnvBlock = TryReadAllBytesAsString(procDir + "/environ");
+        details.CommandLine = TryReadAllBytesAsString(procDir + "/cmdline");
+        details.CurrentDirectory = TryReadLink(procDir + "/cwd");
+        details.ImagePath = TryReadLink(procDir + "/exe");
+        details.ParentPid = ReadParentPidFromStat(procDir + "/stat");
+
+        if (string.IsNullOrEmpty(details.EnvBlock) && string.IsNullOrEmpty(details.CommandLine) &&
+            string.IsNullOrEmpty(details.CurrentDirectory) && string.IsNullOrEmpty(details.ImagePath))
+        {
+            details.Error = "ERROR: could not read /proc/" + pid + " (process may have exited, or you may lack permission)";
+        }
+
+        return details;
     }
 
-    public int GetParentPidOnly(int pid)
+    // Lightweight parent-PID lookup for ancestor-chain walking (--tree): only reads
+    // /proc/<pid>/stat, skipping the environ/cmdline/symlink reads GetProcessDetails does for
+    // the primary matched processes. Returns -1 on any failure.
+    public int GetParentPidOnly(int pid) => ReadParentPidFromStat("/proc/" + pid + "/stat");
+
+    static string TryReadAllBytesAsString(string path)
     {
-        throw new NotImplementedException("Linux support is not implemented yet - see comments in LinuxProcessInspector.cs for the /proc-based plan.");
+        try
+        {
+            return Encoding.UTF8.GetString(File.ReadAllBytes(path));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return "";
+        }
+    }
+
+    // /proc/<pid>/cwd and /proc/<pid>/exe are symlinks; resolve them to their real target path
+    // (following the full chain, equivalent to `readlink -f`).
+    static string TryReadLink(string path)
+    {
+        try
+        {
+            return File.ResolveLinkTarget(path, returnFinalTarget: true)?.FullName ?? "";
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return "";
+        }
+    }
+
+    // /proc/<pid>/stat fields (space-separated): (1) pid (2) comm (3) state (4) ppid ...
+    // The comm field is parenthesized and may itself contain spaces or parens (e.g. a process
+    // renamed to "my (weird) name"), so we can't just Split(' ') from the start - instead, skip
+    // past the LAST ')' in the line (the standard, robust way the "man proc" page recommends
+    // handling this), then the second whitespace-separated token after that is the parent pid
+    // (the first is the single-character state).
+    static int ReadParentPidFromStat(string statPath)
+    {
+        try
+        {
+            string content = File.ReadAllText(statPath);
+            int lastParen = content.LastIndexOf(')');
+            if (lastParen < 0) return -1;
+
+            string rest = content.Substring(lastParen + 1).TrimStart();
+            string[] fields = rest.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            return fields.Length >= 2 && int.TryParse(fields[1], out int ppid) ? ppid : -1;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return -1;
+        }
     }
 
     // /proc/<pid>/cmdline already gives argv split by NUL - no re-parsing needed, unlike Windows.
