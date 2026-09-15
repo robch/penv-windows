@@ -474,17 +474,20 @@ class Program
         WriteBodyLine("  path is shown on its own indented line underneath.");
         Console.WriteLine();
         WriteSectionHeader("TREE MODE (--tree):");
-        WriteBodyLine("  Prints the normal process list first, then an additional '--- tree ---' section below");
-        WriteBodyLine("  it. Walks each matched process's ancestry (parent, grandparent, etc.) as far as it can");
-        WriteBodyLine("  be traced, merging shared ancestors so two matched processes under the same parent");
-        WriteBodyLine("  appear as two branches of one tree, not two separate trees. Distinct ancestries with");
-        WriteBodyLine("  no common ancestor are printed as separate root trees (a forest), each block separated");
-        WriteBodyLine("  by a blank line. Matched PIDs are shown in the PID color; ancestor-only PIDs are muted.");
-        WriteBodyLine("  If --args is also given, each tree node shows its command-line args too.");
+        WriteBodyLine("  Walks each matched process's ancestry (parent, grandparent, etc.) as far as it can be");
+        WriteBodyLine("  traced, merging shared ancestors so two matched processes under the same parent appear");
+        WriteBodyLine("  as two branches of one tree, not two separate trees. Distinct ancestries with no common");
+        WriteBodyLine("  ancestor are printed as separate root trees (a forest), each block separated by a blank");
+        WriteBodyLine("  line. Matched PIDs are shown in the PID color; ancestor-only PIDs are muted. If --args");
+        WriteBodyLine("  is also given, each tree node shows its command-line args too.");
         Console.WriteLine();
         WriteBodyLine("  A matched process whose parent has already exited (or has no parent at all) isn't");
         WriteBodyLine("  shown as a trivial one-node tree - instead it's listed at the end with either");
         WriteBodyLine("  '(dead parent <PID>)' (in red) or '(no parent)'.");
+        Console.WriteLine();
+        WriteBodyLine("  The normal top list is SKIPPED when --tree is given, since the tree (with --args if");
+        WriteBodyLine("  requested) already shows everything it would - UNLESS --where or any env-showing flag");
+        WriteBodyLine("  is also given, since those show info the tree view doesn't.");
         Console.WriteLine();
         WriteSectionHeader("ENV FILTER FLAGS (each implies --env; accepts one or more values, OR'd together):");
         WriteBodyLine("  --env-contains <value> [<value> ...]          (matches if NAME or VALUE contains it)");
@@ -1167,6 +1170,12 @@ class Program
         bool bareArgsMode = parsed.ShowArgs && !showLocationIndented && !parsed.ShouldShowEnv;
         int consoleWidth = SafeConsoleWidth();
 
+        // When --tree is active, the top flat list is redundant UNLESS --where or env vars are
+        // also requested (those show info the tree view doesn't). Args are already shown per-node
+        // in the tree itself, so --args alone doesn't force the top list to print.
+        bool printTopList = !parsed.ShowTree || parsed.ShowWhere || parsed.ShouldShowEnv;
+
+        if (printTopList)
         foreach (var e in entries)
         {
             string pidPrefixPlain = "";
@@ -1251,7 +1260,7 @@ class Program
 
         if (parsed.ShowTree)
         {
-            Console.WriteLine();
+            if (printTopList) Console.WriteLine();
             WriteLine("--- tree ---", Colors.Header);
             Console.WriteLine();
             PrintForest(entries, parsed.ShowArgs);
