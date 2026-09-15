@@ -1024,14 +1024,13 @@ class Program
         return (trees, noParent);
     }
 
-    // Writes "  (<cwd>)" after a process's name/args, with the parens muted and the path itself
-    // in the QuotedString color (not actually quoted, just visually matching quoted values).
+    // Writes "  (<cwd>)" after a process's name/args, muted/dark-gray throughout.
     static void WriteCwdSuffix(string cwd)
     {
         if (string.IsNullOrEmpty(cwd)) return;
         Write("  ");
         Write("(", Colors.Muted);
-        Write(cwd, Colors.QuotedString);
+        Write(cwd, Colors.Muted);
         Write(")", Colors.Muted);
     }
 
