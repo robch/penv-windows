@@ -332,7 +332,7 @@ class Program
         "--value-contains", "--env-value-contains", "--value-starts-with", "--env-value-starts-with"
     };
 
-    static readonly string[] BooleanFlags = new[] { "--where", "--args", "--env", "--pid", "--all", "--tree", "--cwd" };
+    static readonly string[] BooleanFlags = new[] { "--where", "--location", "--args", "--env", "--pid", "--all", "--tree", "--cwd" };
 
     // --- Help-text colorizing helpers -----------------------------------------------------
 
@@ -463,20 +463,22 @@ class Program
         Console.WriteLine("    (no substring/prefix guessing otherwise)");
         Console.WriteLine();
         WriteSectionHeader("OTHER FLAGS:");
-        WriteBodyLine("  --pid     always show (PID) on the main line, even with --where/--args");
-        WriteBodyLine("  --where   show the full path to each process's executable");
-        WriteBodyLine("  --args    show the process's command-line args (fancy-colored) on the main line");
-        WriteBodyLine("  --env     after everything else, show ALL environment variables for each process");
-        WriteBodyLine("  --all     also show processes with no matching environment variables (see below)");
-        WriteBodyLine("  --tree    show each matched process's full ancestry as a real tree (see below)");
-        WriteBodyLine("  --cwd     show the process's current working directory right on its main line");
+        WriteBodyLine("  --pid       always show (PID) on the main line, even with --location/--args");
+        WriteBodyLine("  --location  show the full path to each process's executable");
+        WriteBodyLine("  --args      show the process's command-line args (fancy-colored) on the main line");
+        WriteBodyLine("  --env       after everything else, show ALL environment variables for each process");
+        WriteBodyLine("  --all       also show processes with no matching environment variables (see below)");
+        WriteBodyLine("  --tree      show each matched process's full ancestry as a real tree (see below)");
+        WriteBodyLine("  --cwd       show the process's current working directory right on its main line");
+        WriteBodyLine("  --where     alias for BOTH --location AND --cwd together (\"where\" the thing is, and");
+        WriteBodyLine("              \"where\" it's running)");
         Console.WriteLine();
-        WriteBodyLine("  By default (neither --where nor --args) the main line is '(PID)  name.exe'.");
-        WriteBodyLine("  --where alone shows the full path instead of the PID/name. --args alone shows");
+        WriteBodyLine("  By default (neither --location nor --args) the main line is '(PID)  name.exe'.");
+        WriteBodyLine("  --location alone shows the full path instead of the PID/name. --args alone shows");
         WriteBodyLine("  'name.exe <args>' instead of the PID. Add --pid to force the PID to show either way.");
-        WriteBodyLine("  If BOTH --where and --args are given, the main line is 'name.exe <args>' and the full");
-        WriteBodyLine("  path is shown on its own indented line underneath. --cwd appends '  (<cwd>)' right on");
-        WriteBodyLine("  the main line, after the args (or after the base name if no args) - this also means");
+        WriteBodyLine("  If BOTH --location and --args are given, the main line is 'name.exe <args>' and the");
+        WriteBodyLine("  full path is shown on its own indented line underneath. --cwd appends '  (<cwd>)' right");
+        WriteBodyLine("  on the main line, after the args (or after the base name if no args) - this also means");
         WriteBodyLine("  it shows up per-node when combined with --tree.");
         Console.WriteLine();
         WriteSectionHeader("TREE MODE (--tree):");
@@ -492,8 +494,8 @@ class Program
         WriteBodyLine("  '(dead parent <PID>)' (in red) or '(no parent)'.");
         Console.WriteLine();
         WriteBodyLine("  The normal top list is SKIPPED when --tree is given, since the tree (with --args if");
-        WriteBodyLine("  requested) already shows everything it would - UNLESS --where or any env-showing flag");
-        WriteBodyLine("  is also given, since those show info the tree view doesn't.");
+        WriteBodyLine("  requested) already shows everything it would - UNLESS --location (or --where) or any");
+        WriteBodyLine("  env-showing flag is also given, since those show info the tree view doesn't.");
         Console.WriteLine();
         WriteSectionHeader("ENV FILTER FLAGS (each implies --env; accepts one or more values, OR'd together):");
         WriteBodyLine("  --env-contains <value> [<value> ...]          (matches if NAME or VALUE contains it)");
@@ -517,9 +519,10 @@ class Program
         WriteExampleLine("px 12345 67890");
         WriteExampleLine("px chrome");
         WriteExampleLine("px chrome notepad");
-        WriteExampleLine("px 'cyco*' --where");
+        WriteExampleLine("px 'cyco*' --location");
         WriteExampleLine("px 'cyco*' --args");
-        WriteExampleLine("px 'cyco*' --where --args");
+        WriteExampleLine("px 'cyco*' --location --args");
+        WriteExampleLine("px 'cyco*' --where", "(same as --location --cwd together)");
         WriteExampleLine("px cycodd --env");
         WriteExampleLine("px cycodd CYCODD_DAEMON_CHILD", "(implicit exact-match env var name filter, implies --env)");
         WriteExampleLine("px cycodd 'CYCODD_*'", "(implicit glob env var name filter, implies --env)");
@@ -600,7 +603,7 @@ class Program
         public List<string> NameStartsWith = new List<string>();
         public List<string> ValueContains = new List<string>();
         public List<string> ValueStartsWith = new List<string>();
-        public bool ShowWhere = false;
+        public bool ShowLocation = false;
         public bool ShowArgs = false;
         public bool ShowEnvExplicit = false;
         public bool ShowPidExplicit = false;
@@ -662,9 +665,19 @@ class Program
 
             var argLower = arg.ToLowerInvariant();
 
+            if (argLower == "--location")
+            {
+                result.ShowLocation = true;
+                i++;
+                continue;
+            }
+
             if (argLower == "--where")
             {
-                result.ShowWhere = true;
+                // --where is an alias for BOTH --location and --cwd: "where" the thing IS
+                // (its exe path) and "where" it's running (its current working directory).
+                result.ShowLocation = true;
+                result.ShowCwd = true;
                 i++;
                 continue;
             }
@@ -1132,8 +1145,8 @@ class Program
         foreach (var pid in parsed.Pids)
             detailsByPid[pid] = GetProcessDetails(pid);
 
-        bool showPid = parsed.ShowPidExplicit || (!parsed.ShowWhere && !parsed.ShowArgs);
-        bool showLocationIndented = parsed.ShowWhere && parsed.ShowArgs;
+        bool showPid = parsed.ShowPidExplicit || (!parsed.ShowLocation && !parsed.ShowArgs);
+        bool showLocationIndented = parsed.ShowLocation && parsed.ShowArgs;
 
         var entries = parsed.Pids
             .Select(pid =>
@@ -1144,9 +1157,9 @@ class Program
                 var restArgs = argv.Length > 1 ? argv.Skip(1).Select(EscapeArgumentForWindows).ToArray() : Array.Empty<string>();
 
                 // Sort key matches what's actually relevant/visible: by full path only when
-                // --where is in effect, otherwise by the short name (even if --args is also
+                // --location is in effect, otherwise by the short name (even if --args is also
                 // shown, since the args themselves aren't a stable sort key).
-                var sortKey = parsed.ShowWhere && !string.IsNullOrEmpty(details.ImagePath) ? details.ImagePath : shortName;
+                var sortKey = parsed.ShowLocation && !string.IsNullOrEmpty(details.ImagePath) ? details.ImagePath : shortName;
 
                 (string Raw, string Name, string Value)[] parsedVars = Array.Empty<(string, string, string)>();
                 int matchCount = 0;
@@ -1195,7 +1208,7 @@ class Program
 
         int pidDigits = entries.Max(e => e.Pid.ToString().Length);
 
-        // In "bare args" mode (--args given, but no --where location line and no env vars to
+        // In "bare args" mode (--args given, but no --location line and no env vars to
         // separate entries), a single \n between processes isn't enough if a line wraps in the
         // terminal - it becomes impossible to tell where one process's args end and the next
         // one's PID/name begins. Detect that case and, if a given line's actual rendered width
@@ -1203,10 +1216,10 @@ class Program
         bool bareArgsMode = parsed.ShowArgs && !showLocationIndented && !parsed.ShouldShowEnv;
         int consoleWidth = SafeConsoleWidth();
 
-        // When --tree is active, the top flat list is redundant UNLESS --where or env vars are
+        // When --tree is active, the top flat list is redundant UNLESS --location or env vars are
         // also requested (those show info the tree view doesn't). Args are already shown per-node
         // in the tree itself, so --args alone doesn't force the top list to print.
-        bool printTopList = !parsed.ShowTree || parsed.ShowWhere || parsed.ShouldShowEnv;
+        bool printTopList = !parsed.ShowTree || parsed.ShowLocation || parsed.ShouldShowEnv;
 
         if (printTopList)
         foreach (var e in entries)
@@ -1233,7 +1246,7 @@ class Program
                     WriteArgColored(a, ref seenOption);
                 }
             }
-            else if (parsed.ShowWhere && !string.IsNullOrEmpty(e.Details.ImagePath))
+            else if (parsed.ShowLocation && !string.IsNullOrEmpty(e.Details.ImagePath))
             {
                 WriteExePathColored(e.Details.ImagePath);
             }
@@ -1254,7 +1267,7 @@ class Program
                     Console.WriteLine();
             }
 
-            // --- Indented location line, only when both --args and --where are given ---
+            // --- Indented location line, only when both --args and --location are given ---
             bool hasPathLine = showLocationIndented && !string.IsNullOrEmpty(e.Details.ImagePath);
             if (hasPathLine)
             {
