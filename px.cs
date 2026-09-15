@@ -282,10 +282,11 @@ class Program
         WriteBodyLine("  --where     alias for BOTH --location AND --cwd together (\"where\" the thing is, and");
         WriteBodyLine("              \"where\" it's running)");
         Console.WriteLine();
-        WriteBodyLine("  By default (neither --location nor --args) the main line is '(PID)  name.exe'.");
-        WriteBodyLine("  --location alone shows the full path instead of the PID/name. --args alone shows");
-        WriteBodyLine("  'name.exe <args>' instead of the PID. Add --pid to force the PID to show either way.");
-        WriteBodyLine("  If BOTH --location and --args are given, the main line is 'name.exe <args>' and the");
+        WriteBodyLine("  By default (neither --location nor --args) the main line is '(PID)  name' (with a");
+        WriteBodyLine("  '.exe' suffix on Windows). --location alone shows the full path instead of the");
+        WriteBodyLine("  PID/name. --args alone shows 'name <args>' instead of the PID. Add --pid to force the");
+        WriteBodyLine("  PID to show either way. If BOTH --location and --args are given, the main line is");
+        WriteBodyLine("  'name <args>' and the");
         WriteBodyLine("  full path is shown on its own indented line underneath. --cwd appends '  (<cwd>)' right");
         WriteBodyLine("  on the main line, after the args (or after the base name if no args) - this also means");
         WriteBodyLine("  it shows up per-node when combined with --tree.");
@@ -422,11 +423,17 @@ class Program
         public bool ShowEnvAll => ShowEnvExplicit && !HasFilters;
     }
 
+    // Windows executables conventionally get a ".exe" suffix appended for display (matching
+    // what you'd type at a shell prompt); Linux/macOS executables have no such convention, so
+    // the suffix would look nonsensical there (e.g. "bash.exe" instead of "bash").
+    static readonly string ExeSuffix = OperatingSystem.IsWindows() ? ".exe" : "";
+
     // Process.ProcessName never includes the ".exe" extension, so strip a trailing ".exe"
     // (case-insensitive) from a token before comparing it against process names - lets
-    // 'px cycod.exe' work the same as 'px cycod'.
+    // 'px cycod.exe' work the same as 'px cycod'. Only meaningful on Windows; a no-op elsewhere
+    // since there's no suffix convention to strip.
     static string StripExeSuffix(string arg) =>
-        arg.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ? arg.Substring(0, arg.Length - 4) : arg;
+        ExeSuffix.Length > 0 && arg.EndsWith(ExeSuffix, StringComparison.OrdinalIgnoreCase) ? arg.Substring(0, arg.Length - ExeSuffix.Length) : arg;
 
     static Regex GlobToRegex(string glob)
     {
@@ -811,7 +818,7 @@ class Program
                         if (includeCwd)
                             parentNode.Cwd = det.CurrentDirectory;
                     }
-                    parentNode.Name = GetProcessNameSafe(parentPid) + ".exe";
+                    parentNode.Name = GetProcessNameSafe(parentPid) + ExeSuffix;
                 }
 
                 child.HasParent = true;
@@ -1126,7 +1133,7 @@ class Program
             .Select(pid =>
             {
                 var details = detailsByPid[pid];
-                var shortName = GetProcessNameSafe(pid) + ".exe";
+                var shortName = GetProcessNameSafe(pid) + ExeSuffix;
                 var argv = Inspector.ParseCommandLine(details.CommandLine);
                 var restArgs = argv.Length > 1 ? argv.Skip(1).Select(Inspector.EscapeArgumentForDisplay).ToArray() : Array.Empty<string>();
 
