@@ -245,6 +245,7 @@ class Program
         Console.WriteLine();
         WriteSectionHeader("USAGE:");
         Console.WriteLine("  px <pid|process-name|name-fragment> [...] [<filter-value> ...] [<filter-flag> <value> [<value> ...]] ...");
+        Console.WriteLine("  px --tree|--args|--env|... (with no target - implies '*', i.e. every process)");
         Console.WriteLine("  px <pid> shell");
         Console.WriteLine("  px <pid> run [--] <command> [<arg> ...]");
         Console.WriteLine("  px <pid> rerun");
