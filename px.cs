@@ -1120,6 +1120,15 @@ class Program
     {
         try { Console.OutputEncoding = Encoding.UTF8; } catch { /* redirected/non-interactive output may not allow this */ }
 
+        // px itself must never be killed by Ctrl-C - especially while a child process launched
+        // via 'run'/'rerun'/'shell' is running (e.g. waiting on child.WaitForExit()). Without
+        // this handler, the default Ctrl-C behavior terminates the whole console process, which
+        // would kill px right along with (or even instead of) the child it's supposed to be
+        // babysitting. Marking the event as handled suppresses that default termination; the
+        // Ctrl-C (SIGINT) still reaches the child process normally via the shared console/process
+        // group, so the child can react to it as it normally would.
+        Console.CancelKeyPress += (_, e) => e.Cancel = true;
+
         if (args.Length == 0)
         {
             PrintUsage();
