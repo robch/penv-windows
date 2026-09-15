@@ -454,6 +454,13 @@ class Program
         // since it involves file I/O on Linux/macOS.
         var displayNames = allProcesses.ToDictionary(p => p.Id, p => Inspector.GetDisplayName(p.Id));
 
+        // Tracks whether any token was actually an attempt at specifying a target (a PID, a
+        // glob, a bare name) as opposed to purely recognized flags (e.g. 'px --tree' alone).
+        // Used below to default to "all processes" when the user supplied flags only and never
+        // tried to name a target at all - as opposed to naming one that simply didn't match
+        // anything (a likely typo), which should still produce today's explicit error.
+        bool sawTargetToken = false;
+
         // Pass 1: handle filter flags, numeric PIDs, and exact process-name matches
         // immediately (these are unambiguous). Anything else is deferred to "pending".
         int i = 0;
@@ -547,6 +554,7 @@ class Program
             int pid;
             if (int.TryParse(arg, out pid))
             {
+                sawTargetToken = true;
                 result.Pids.Add(pid);
                 i++;
                 continue;
@@ -554,6 +562,7 @@ class Program
 
             if (arg.IndexOf('*') >= 0 || arg.IndexOf('?') >= 0)
             {
+                sawTargetToken = true;
                 // Explicit wildcard: try it as a process-name glob first (unconditionally,
                 // regardless of whether other exact matches already exist). If it matches
                 // zero processes, don't discard it - let it fall through to "pending" so it
@@ -573,6 +582,7 @@ class Program
             }
 
             var exactMatches = allProcesses.Where(p => string.Equals(displayNames[p.Id], StripExeSuffix(arg), StringComparison.OrdinalIgnoreCase)).ToArray();
+            sawTargetToken = true;
             if (exactMatches.Length > 0)
             {
                 foreach (var p in exactMatches) result.Pids.Add(p.Id);
@@ -607,6 +617,14 @@ class Program
             result.ImplicitFilters.Add(arg);
             result.UnresolvedTargets.Add(arg);
         }
+
+        // Flags-only invocation (e.g. 'px --tree'): no token was ever an attempt at naming a
+        // target, so default to "all processes" - the same as if '*' had been typed explicitly.
+        // A token that WAS an attempt but matched nothing (a likely typo) still falls through to
+        // the normal "no PID and no running process matched" error in Main, since sawTargetToken
+        // is true in that case.
+        if (!sawTargetToken && result.Pids.Count == 0)
+            foreach (var p in allProcesses) result.Pids.Add(p.Id);
 
         return result;
     }
