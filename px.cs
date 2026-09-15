@@ -144,6 +144,7 @@ class Program
         public string EnvBlock = "";
         public string ImagePath = "";
         public string CommandLine = "";
+        public string CurrentDirectory = "";
         public string Error = ""; // empty = no error
         public int ParentPid = -1; // -1 = unknown/not read
     }
@@ -212,7 +213,9 @@ class Program
                 return details;
             }
 
-            // RTL_USER_PROCESS_PARAMETERS (64-bit): ImagePathName UNICODE_STRING at 0x60, CommandLine at 0x70.
+            // RTL_USER_PROCESS_PARAMETERS (64-bit): CurrentDirectory.DosPath UNICODE_STRING at 0x38
+            // (part of the embedded CURDIR struct), ImagePathName at 0x60, CommandLine at 0x70.
+            details.CurrentDirectory = ReadRemoteUnicodeString(h, ppBuf, 0x38);
             details.ImagePath = ReadRemoteUnicodeString(h, ppBuf, 0x60);
             details.CommandLine = ReadRemoteUnicodeString(h, ppBuf, 0x70);
 
@@ -329,7 +332,7 @@ class Program
         "--value-contains", "--env-value-contains", "--value-starts-with", "--env-value-starts-with"
     };
 
-    static readonly string[] BooleanFlags = new[] { "--where", "--args", "--env", "--pid", "--all", "--tree" };
+    static readonly string[] BooleanFlags = new[] { "--where", "--args", "--env", "--pid", "--all", "--tree", "--cwd" };
 
     // --- Help-text colorizing helpers -----------------------------------------------------
 
@@ -466,12 +469,14 @@ class Program
         WriteBodyLine("  --env     after everything else, show ALL environment variables for each process");
         WriteBodyLine("  --all     also show processes with no matching environment variables (see below)");
         WriteBodyLine("  --tree    show each matched process's full ancestry as a real tree (see below)");
+        WriteBodyLine("  --cwd     show the process's current working directory on an indented line");
         Console.WriteLine();
         WriteBodyLine("  By default (neither --where nor --args) the main line is '(PID)  name.exe'.");
         WriteBodyLine("  --where alone shows the full path instead of the PID/name. --args alone shows");
         WriteBodyLine("  'name.exe <args>' instead of the PID. Add --pid to force the PID to show either way.");
         WriteBodyLine("  If BOTH --where and --args are given, the main line is 'name.exe <args>' and the full");
-        WriteBodyLine("  path is shown on its own indented line underneath.");
+        WriteBodyLine("  path is shown on its own indented line underneath. --cwd adds a 'cwd: <path>' line to");
+        WriteBodyLine("  that same indented block (or creates its own if --where+--args aren't both given).");
         Console.WriteLine();
         WriteSectionHeader("TREE MODE (--tree):");
         WriteBodyLine("  Walks each matched process's ancestry (parent, grandparent, etc.) as far as it can be");
@@ -522,6 +527,8 @@ class Program
         WriteExampleLine("px cycodd --env-contains BLH", "(matches if var NAME or VALUE contains 'BLH')");
         WriteExampleLine("px cycodd --env-name-contains DAEMON --all", "(show every process, even ones with no match)");
         WriteExampleLine("px 'cyco*' --tree", "(show all matched processes as a single ancestry tree/forest)");
+        WriteExampleLine("px cycodd --cwd", "(show each process's current working directory)");
+        WriteExampleLine("px cycodd --where --args --cwd", "(path + cwd together, indented under the args line)");
     }
 
     static string GetProcessNameSafe(int pid)
@@ -597,6 +604,7 @@ class Program
         public bool ShowPidExplicit = false;
         public bool ShowAll = false;
         public bool ShowTree = false;
+        public bool ShowCwd = false;
 
         // Leftover tokens (not resolved to a process): matched against env var NAMES using
         // an exact-first progression (see CompileImplicitFilters), NOT contains/starts-with,
@@ -690,6 +698,13 @@ class Program
             if (argLower == "--tree")
             {
                 result.ShowTree = true;
+                i++;
+                continue;
+            }
+
+            if (argLower == "--cwd")
+            {
+                result.ShowCwd = true;
                 i++;
                 continue;
             }
@@ -1164,7 +1179,7 @@ class Program
         // terminal - it becomes impossible to tell where one process's args end and the next
         // one's PID/name begins. Detect that case and, if a given line's actual rendered width
         // would exceed the console width, add an extra blank line after it.
-        bool bareArgsMode = parsed.ShowArgs && !showLocationIndented && !parsed.ShouldShowEnv;
+        bool bareArgsMode = parsed.ShowArgs && !showLocationIndented && !parsed.ShowCwd && !parsed.ShouldShowEnv;
         int consoleWidth = SafeConsoleWidth();
 
         // When --tree is active, the top flat list is redundant UNLESS --where or env vars are
@@ -1215,18 +1230,28 @@ class Program
                     Console.WriteLine();
             }
 
-            // --- Indented location line, only when both --args and --where are given ---
-            if (showLocationIndented && !string.IsNullOrEmpty(e.Details.ImagePath))
+            // --- Indented location/cwd block: path shown when --where+--args both given,
+            // cwd shown whenever --cwd is given. Both can appear together in one block.
+            bool hasPathLine = showLocationIndented && !string.IsNullOrEmpty(e.Details.ImagePath);
+            bool hasCwdLine = parsed.ShowCwd && !string.IsNullOrEmpty(e.Details.CurrentDirectory);
+            if (hasPathLine || hasCwdLine)
             {
                 Console.WriteLine();
-                WriteLine("  " + e.Details.ImagePath, Colors.Muted);
+                if (hasPathLine)
+                    WriteLine("  " + e.Details.ImagePath, Colors.Muted);
+                if (hasCwdLine)
+                {
+                    Write("  ");
+                    Write("cwd: ", Colors.OptName);
+                    WriteLine(e.Details.CurrentDirectory, Colors.Muted);
+                }
                 Console.WriteLine();
             }
 
             // --- Env vars, only if explicitly requested or filtered ---
             if (!parsed.ShouldShowEnv) continue;
 
-            if (!showLocationIndented) Console.WriteLine();
+            if (!(hasPathLine || hasCwdLine)) Console.WriteLine();
 
             if (!string.IsNullOrEmpty(e.Details.Error))
             {
