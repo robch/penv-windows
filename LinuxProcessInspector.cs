@@ -35,8 +35,14 @@ class LinuxProcessInspector : IProcessInspector
         // same "NAME=VALUE\0NAME=VALUE\0..." / "arg0\0arg1\0..." shape the rest of px already
         // expects (ParseEnvironmentBlock in px.cs splits EnvBlock on '\0'; ParseCommandLine below
         // does the same for CommandLine) - identical to what the Windows PEB reader produces.
-        details.EnvBlock = TryReadAllBytesAsString(procDir + "/environ");
-        details.CommandLine = TryReadAllBytesAsString(procDir + "/cmdline");
+        //
+        // /proc/<pid>/environ specifically is only readable by the process's own owner (or root) -
+        // unlike cmdline/exe/cwd/stat, which are normally world-readable. So a permission failure
+        // reading JUST environ (e.g. inspecting a root-owned process as a regular user) must be
+        // surfaced as a real error, not silently presented as "this process simply has zero
+        // environment variables" - that would be actively misleading.
+        details.EnvBlock = TryReadAllBytesAsString(procDir + "/environ", out bool environPermissionDenied);
+        details.CommandLine = TryReadAllBytesAsString(procDir + "/cmdline", out _);
         details.CurrentDirectory = TryReadLink(procDir + "/cwd");
         details.ImagePath = TryReadLink(procDir + "/exe");
         details.ParentPid = ReadParentPidFromStat(procDir + "/stat");
@@ -45,6 +51,11 @@ class LinuxProcessInspector : IProcessInspector
             string.IsNullOrEmpty(details.CurrentDirectory) && string.IsNullOrEmpty(details.ImagePath))
         {
             details.Error = "ERROR: could not read /proc/" + pid + " (process may have exited, or you may lack permission)";
+        }
+        else if (environPermissionDenied)
+        {
+            details.Error = "ERROR: permission denied reading environment variables for process " + pid +
+                " (owned by another user - try sudo)";
         }
 
         return details;
@@ -55,13 +66,21 @@ class LinuxProcessInspector : IProcessInspector
     // the primary matched processes. Returns -1 on any failure.
     public int GetParentPidOnly(int pid) => ReadParentPidFromStat("/proc/" + pid + "/stat");
 
-    static string TryReadAllBytesAsString(string path)
+    static string TryReadAllBytesAsString(string path) => TryReadAllBytesAsString(path, out _);
+
+    static string TryReadAllBytesAsString(string path, out bool permissionDenied)
     {
+        permissionDenied = false;
         try
         {
             return Encoding.UTF8.GetString(File.ReadAllBytes(path));
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        catch (UnauthorizedAccessException)
+        {
+            permissionDenied = true;
+            return "";
+        }
+        catch (IOException)
         {
             return "";
         }
