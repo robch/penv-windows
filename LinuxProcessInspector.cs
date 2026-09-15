@@ -113,6 +113,37 @@ class LinuxProcessInspector : IProcessInspector
             : cmdLine.Split('\0', StringSplitOptions.RemoveEmptyEntries);
     }
 
+    // The kernel's "comm" field (what Process.ProcessName reads on Linux, and what
+    // /proc/<pid>/stat's 2nd field contains) is a fixed 16-byte buffer - only 15 printable
+    // characters survive, always, no exceptions. That silently breaks both display AND
+    // matching for perfectly common, recognizable names:
+    //   systemd-resolved      (16 chars) -> comm: "systemd-resolve"  (px resolved -> no match)
+    //   systemd-networkd      (16 chars) -> comm: "systemd-network"  (px networkd -> no match)
+    //   unattended-upgrades   (19 chars) -> comm: "unattended-upgr"  (px upgrades -> no match)
+    //
+    // `ps` avoids this entirely by showing argv[0] (or a process's self-rewritten cmdline,
+    // e.g. "postgres: checkpointer") instead of comm - argv/cmdline has no such length limit.
+    // We do the same here: prefer the basename of argv[0] from /proc/<pid>/cmdline, and only
+    // fall back to the truncated comm name if cmdline couldn't be read (e.g. permission denied,
+    // or a kernel thread with no argv at all).
+    public string GetDisplayName(int pid)
+    {
+        string cmdline = TryReadAllBytesAsString("/proc/" + pid + "/cmdline");
+        if (!string.IsNullOrEmpty(cmdline))
+        {
+            string argv0 = cmdline.Split('\0', StringSplitOptions.RemoveEmptyEntries) is { Length: > 0 } parts
+                ? parts[0]
+                : "";
+            if (!string.IsNullOrEmpty(argv0))
+                return System.IO.Path.GetFileName(argv0.TrimEnd('/'));
+        }
+
+        // Fallback: /proc/<pid>/comm (same truncated value as Process.ProcessName), trimmed of
+        // its trailing newline.
+        string comm = TryReadAllBytesAsString("/proc/" + pid + "/comm").TrimEnd('\n');
+        return !string.IsNullOrEmpty(comm) ? comm : "?";
+    }
+
     // POSIX shell-safe quoting: wrap in single quotes, escaping any embedded single quote as
     // '\'' (close quote, escaped literal quote, reopen quote). Simpler and more robust than
     // trying to mirror bash's many special characters individually.

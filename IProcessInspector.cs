@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Diagnostics;
 
 // Everything px needs to know "about another process" that the OS doesn't hand you through
 // ordinary managed APIs (env vars, raw command line, image path, cwd, parent pid) lives behind
@@ -26,6 +27,21 @@ interface IProcessInspector
     // back into a shell on the current platform (Windows CommandLineToArgvW-compatible
     // quoting vs. POSIX shell quoting).
     string EscapeArgumentForDisplay(string arg);
+
+    // The "friendly name" used for both display and name/substring/glob matching (e.g. 'px
+    // bash', 'px 'cyco*''). Default implementation just uses Process.ProcessName, which is
+    // fine on Windows (derived from the exe's image name, no length limit) but is overridden
+    // on Linux to avoid the kernel's 15-char truncated "comm" field - see
+    // LinuxProcessInspector.GetDisplayName for why that matters (e.g. "systemd-resolved" would
+    // otherwise show/match as the truncated "systemd-resolve").
+    string GetDisplayName(int pid) =>
+        SafeProcessName(pid);
+
+    protected static string SafeProcessName(int pid)
+    {
+        try { return System.Diagnostics.Process.GetProcessById(pid).ProcessName; }
+        catch { return "?"; }
+    }
 }
 
 class ProcessDetails

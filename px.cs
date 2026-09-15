@@ -348,17 +348,10 @@ class Program
         WriteExampleLine("px 'cyco*' --tree --cwd", "(cwd shown per-node in the tree too)");
     }
 
-    static string GetProcessNameSafe(int pid)
-    {
-        try
-        {
-            return Process.GetProcessById(pid).ProcessName;
-        }
-        catch
-        {
-            return "?";
-        }
-    }
+    // The "friendly name" used for display and matching, delegated to the platform inspector -
+    // on Linux/macOS this avoids the kernel's truncated "comm" field (see
+    // LinuxProcessInspector.GetDisplayName); on Windows it's just Process.ProcessName.
+    static string GetProcessNameSafe(int pid) => Inspector.GetDisplayName(pid);
 
     // Cached once per run: the full snapshot of currently-running PIDs, from Process.GetProcesses().
     // Used instead of opening each individual process handle to check aliveness, since
@@ -453,6 +446,13 @@ class Program
         var result = new ParsedArgs();
         var allProcesses = Process.GetProcesses();
         var pending = new List<string>();
+
+        // Match names/globs/substrings against the platform's "friendly name" (Inspector.GetDisplayName)
+        // rather than Process.ProcessName directly - on Linux/macOS that avoids the kernel's
+        // 15-char-truncated "comm" field breaking lookups like 'px resolved' for
+        // 'systemd-resolved' (see LinuxProcessInspector.GetDisplayName). Computed once per PID
+        // since it involves file I/O on Linux/macOS.
+        var displayNames = allProcesses.ToDictionary(p => p.Id, p => Inspector.GetDisplayName(p.Id));
 
         // Pass 1: handle filter flags, numeric PIDs, and exact process-name matches
         // immediately (these are unambiguous). Anything else is deferred to "pending".
@@ -559,7 +559,7 @@ class Program
                 // zero processes, don't discard it - let it fall through to "pending" so it
                 // can still be used as an env-var-name glob filter (e.g. 'CYCODD_*').
                 var regex = GlobToRegex(StripExeSuffix(arg));
-                var globMatches = allProcesses.Where(p => regex.IsMatch(p.ProcessName)).ToArray();
+                var globMatches = allProcesses.Where(p => regex.IsMatch(displayNames[p.Id])).ToArray();
                 if (globMatches.Length > 0)
                 {
                     foreach (var p in globMatches) result.Pids.Add(p.Id);
@@ -572,7 +572,7 @@ class Program
                 continue;
             }
 
-            var exactMatches = allProcesses.Where(p => string.Equals(p.ProcessName, StripExeSuffix(arg), StringComparison.OrdinalIgnoreCase)).ToArray();
+            var exactMatches = allProcesses.Where(p => string.Equals(displayNames[p.Id], StripExeSuffix(arg), StringComparison.OrdinalIgnoreCase)).ToArray();
             if (exactMatches.Length > 0)
             {
                 foreach (var p in exactMatches) result.Pids.Add(p.Id);
@@ -593,7 +593,7 @@ class Program
             var stillPending = new List<string>();
             foreach (var arg in pending)
             {
-                var substringMatches = allProcesses.Where(p => p.ProcessName.IndexOf(StripExeSuffix(arg), StringComparison.OrdinalIgnoreCase) >= 0).ToArray();
+                var substringMatches = allProcesses.Where(p => displayNames[p.Id].IndexOf(StripExeSuffix(arg), StringComparison.OrdinalIgnoreCase) >= 0).ToArray();
                 if (substringMatches.Length > 0)
                     foreach (var p in substringMatches) result.Pids.Add(p.Id);
                 else
