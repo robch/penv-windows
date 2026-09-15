@@ -1261,8 +1261,6 @@ class Program
         if (parsed.ShowTree)
         {
             if (printTopList) Console.WriteLine();
-            WriteLine("--- tree ---", Colors.Header);
-            Console.WriteLine();
             PrintForest(entries, parsed.ShowArgs);
         }
     }
